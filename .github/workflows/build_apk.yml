@@ -2270,6 +2270,190 @@ jobs:
             Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
           }
           
+          class _GuideArticle {
+            const _GuideArticle({required this.title, required this.summary, required this.icon, required this.steps});
+            final String title;
+            final String summary;
+            final IconData icon;
+            final List<String> steps;
+            String get searchText => <String>[title, summary, ...steps].join(' ').toLowerCase();
+          }
+          
+          class GuidesScreen extends StatefulWidget {
+            const GuidesScreen({super.key});
+            @override
+            State<GuidesScreen> createState() => _GuidesScreenState();
+          }
+          
+          class _GuidesScreenState extends State<GuidesScreen> {
+            final TextEditingController _search = TextEditingController();
+            String _query = '';
+          
+            static const List<_GuideArticle> _articles = <_GuideArticle>[
+              _GuideArticle(title: '1. Start here: create your first app', summary: 'A complete first-run walkthrough from project name to installed APK.', icon: Icons.rocket_launch_outlined, steps: <String>[
+                'Connect a GitHub account first. The account is used to create a private repository, save the project source, start builds, and download build artifacts.',
+                'Tap New project. Enter a display name such as My Notes and an Android application ID such as com.example.mynotes. Use lowercase reverse-domain segments with no spaces.',
+                'Choose an optional launcher image. The image is preserved; no background-removal algorithm is run. An opaque image gets a white canvas so the icon does not unexpectedly turn black.',
+                'Open Dart project files. Pick a starter template, keep the existing project, or import a Dart file, folder, or ZIP. The entry point must be lib/main.dart.',
+                'Edit files by tapping them in the folder browser. Changes are saved as a draft automatically, but check that the latest edit appears before starting a build.',
+                'At Build and download, choose APK for direct Android installation or AAB for Google Play upload. Tap Build and keep the app connected while it waits for GitHub Actions.',
+                'When the run finishes, use Save to choose where to store the result, Share to send it to another app, or Install for an APK. AAB files are not directly installable.',
+              ]),
+              _GuideArticle(title: '2. GitHub connection and permissions', summary: 'How to create a token, add accounts, and understand repository settings.', icon: Icons.key_outlined, steps: <String>[
+                'In GitHub, open Settings, Developer settings, Personal access tokens, Tokens classic, then Generate new token classic.',
+                'Enable the repo and workflow scopes for the current classic-token flow. Give the token an expiry date and store it in a password manager. GitHub only shows the full token once.',
+                'In Simple App Builder, enter the matching username and token. The app checks that the token belongs to that account and stores it using Android secure storage.',
+                'You can add more accounts in Settings. A secondary account is useful if the primary account hits a rate limit, but it only has access to repositories allowed to that account.',
+                'The Builder workflow template repository is different from each app private repository. The template repository contains build_apk.yml; each app repository holds that app source and its artifacts.',
+                'Never paste a GitHub token, signing password, or keystore data into Dart code. Revoke any token that has been exposed and add a replacement account in Settings.',
+              ]),
+              _GuideArticle(title: '3. Understand the project folder browser', summary: 'Navigate folders, add files, rename items, and keep the source tree organized.', icon: Icons.folder_open_outlined, steps: <String>[
+                'Tap a folder to enter it. The path bar shows where you are. Use the up-arrow button to return to its parent folder.',
+                'Create folder adds a folder inside the currently open folder. Create file makes a source file there. You can also enter a relative path such as screens/home.dart; missing parent folders are created automatically.',
+                'Keep Flutter code under lib/. The required application entry point is lib/main.dart and cannot be deleted. Other Dart code normally goes under lib/screens/, lib/widgets/, lib/models/, or lib/services/.',
+                'Native Android source goes under android/app/src/main/kotlin/ or android/app/src/main/java/. XML resources go under android/app/src/main/res/<resource-type>/.',
+                'Use the menu beside a folder to rename it, delete it and its contents, or create a file inside it. Deleting a folder is permanent for the next saved project version, so confirm the path first.',
+                'Folder and ZIP import ignores generated folders such as build, .gradle, .dart_tool and node_modules. It imports supported text source, not every binary asset or full Gradle project configuration.',
+              ]),
+              _GuideArticle(title: '4. Flutter and Dart basics', summary: 'What the entry point does and how to split a large app into files.', icon: Icons.code_outlined, steps: <String>[
+                'A Flutter app usually starts with void main() => runApp(const MyApp());. The MyApp widget returns MaterialApp, and the initial screen is assigned to home.',
+                'A screen is often a StatelessWidget if its visible content does not keep mutable local state, or a StatefulWidget if it changes while the user interacts with it.',
+                'Use Scaffold for the screen frame, AppBar for the top bar, body for content, and buttons with onPressed callbacks for actions. A button without an action callback will not do anything.',
+                'To use a class from another file, add an import. Relative imports such as import screens/home_screen.dart; are useful inside lib, while package imports must use the correct Dart package name.',
+                'Compile errors often point to the first missing symbol, not every later error. Fix the first error in the log, save the file, and rebuild before trying to fix downstream messages.',
+                'Keep one responsibility per file as the project grows. For example, put screens in lib/screens, reusable controls in lib/widgets, and plain data models in lib/models.',
+              ]),
+              _GuideArticle(title: '5. Add native Android Kotlin or Java code', summary: 'Create a native Android activity, import source, and add XML resources.', icon: Icons.android, steps: <String>[
+                'Open the Dart project files step and choose Add blank Android template. Select Kotlin or Java and provide a destination folder under android/app/src/main/kotlin/ or android/app/src/main/java/.',
+                'The template creates a blank native Activity class inside the Flutter project’s existing Android app module and registers it in the custom manifest fragment. It is not a separate Android Studio Gradle project; Flutter continues to use its generated MainActivity as the app entry point.',
+                'To bring your own source in, tap Import Android source and select a .kt, .java, XML, AndroidManifest.xml, or ProGuard file. Confirm the destination path before importing.',
+                'Resource XML files belong below android/app/src/main/res/, for example values/strings.xml or layout/activity_example.xml. The selected resource folder type must match Android conventions.',
+                'AndroidManifest.xml is merged with Flutter generated manifest settings. Avoid adding a second exported launcher activity unless you deliberately intend to change the app launch behavior.',
+                'For Kotlin or Java functionality to be called from Dart, you usually need a platform channel, often MethodChannel, implemented on both the Dart and native sides. Adding a native class alone does not automatically connect it to Flutter UI.',
+                'Project-wide Gradle scripts are generated and patched by the workflow, so they are intentionally not imported as ordinary source files. Use the supported Maven dependency field for extra Android libraries.',
+              ]),
+              _GuideArticle(title: '6. Add packages and Android libraries', summary: 'When to use pub.dev packages and native Maven coordinates.', icon: Icons.extension_outlined, steps: <String>[
+                'For a Dart package, enter its package name in Additional pub.dev packages, separated with commas, for example http,provider. A package referenced by a package: import is also detected by the build workflow.',
+                'A package import must match an actual published package name. If dependency resolution fails, check spelling, package availability, Flutter/Dart SDK requirements, and version constraints.',
+                'For an Android-only library, use Android Maven dependencies in group:artifact:version format, such as androidx.core:core-ktx:1.15.0. Separate multiple coordinates with commas.',
+                'Do not add Flutter plugins to the Maven dependency field. Plugins belong in pub.dev dependencies and may also require Android permissions or configuration.',
+                'Some plugins require Android Gradle Plugin, Kotlin, minSdk, or manifest settings that conflict with the generated template. Read the plugin documentation and use the build logs to identify which requirement is missing.',
+              ]),
+              _GuideArticle(title: '7. Launcher icon and Android theme', summary: 'How the selected image is prepared and what themed icons need.', icon: Icons.image_outlined, steps: <String>[
+                'Use a square PNG for the cleanest result, preferably with transparency if the logo is meant to float on the launcher background. JPEG images are opaque and therefore use a white canvas.',
+                'The current workflow does not remove white pixels or guess the background color. This avoids destroying white details and avoids turning opaque logos black.',
+                'A regular launcher icon and an adaptive foreground are generated. The monochrome themed icon is only useful if its source has suitable alpha and recognizable one-color artwork.',
+                'On supported Android launchers, enable Themed icons under Wallpaper and style. Theme tint is controlled by Android and the launcher; the Builder cannot force every launcher to apply it.',
+                'If the icon looks stale after updating, install the newly built APK and allow the launcher to refresh its cache. Check the artifact version and app ID to ensure you installed the new build.',
+              ]),
+              _GuideArticle(title: '8. APK vs AAB and downloading results', summary: 'Choose the correct output and recover a build after a network interruption.', icon: Icons.download_outlined, steps: <String>[
+                'APK is an installable Android package. It is the usual choice for testing on your own phone or sharing a direct install with another tester.',
+                'AAB is an Android App Bundle intended for Google Play Console distribution. It is not an installable APK, so the Install button is not shown for AAB output.',
+                'GitHub Actions performs the build in the cloud. The app polls the run status and then downloads the artifact. Queue time, package downloads and cache state affect the total time.',
+                'If GitHub says Success but the app cannot fetch the artifact, open the run in GitHub and check that an artifact was uploaded and has not expired. Try Load build logs or retry the download when network access returns.',
+                'If the phone reports Failed host lookup, verify internet and DNS access to api.github.com, disable captive Wi-Fi login, and retry. A temporary connection failure does not prove the remote build failed.',
+              ]),
+              _GuideArticle(title: '9. Optional release signing', summary: 'What signing means and how to protect the keystore.', icon: Icons.verified_user_outlined, steps: <String>[
+                'Leave signing disabled for ordinary local tests. Android can install an APK signed with the workflow test key, but it is not a suitable stable Play publishing identity.',
+                'To publish releases with your own signature, create a release keystore and add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD and ANDROID_KEY_ALIAS as GitHub Actions secrets in the app repository.',
+                'Keep the same keystore for every update to the same published app. If the signing identity changes, Android or Google Play may refuse the update.',
+                'Treat the keystore and its passwords like account credentials. Never commit them to source files, screenshots, public repositories, or chat messages.',
+                'If signing fails, verify secret names exactly, ensure the base64 value represents a valid keystore, confirm the alias, and inspect the signing section of the GitHub Actions log.',
+              ]),
+              _GuideArticle(title: '10. Automatic backups and private repositories', summary: 'Where projects are saved and how restoration works.', icon: Icons.backup_outlined, steps: <String>[
+                'The app stores the project list on the device and stores GitHub tokens using secure storage. Project source is synchronized to private GitHub repositories associated with the connected account.',
+                'Backup sync is scheduled after changes, periodically while the app is active, and when the app resumes. Android may suspend timers while the app is backgrounded or closed; this is not a guaranteed always-running service.',
+                'Do not make a backup repository public. Source archives can include proprietary code, endpoints, or other material you should not expose.',
+                'When adding a second account, the app can maintain a separate backup repository for that account. Ensure the account has sufficient repository permissions before relying on the backup.',
+                'If a project is missing, check the backup status on the home screen, the connected account, and the backup repository in GitHub before deleting local data.',
+              ]),
+              _GuideArticle(title: '11. Fix common build problems', summary: 'A practical checklist for the most common errors.', icon: Icons.build_circle_outlined, steps: <String>[
+                'Dart error such as Undefined name or method not found: fix the first lib/*.dart error in the log. Check missing imports, spelling, constructors and file paths.',
+                'Pub dependency solver failed: make sure package names are valid, remove incompatible package combinations, and check the Flutter version constraints in pub.dev documentation.',
+                'Kotlin plugin or Android Gradle error: identify the named plugin module first. An old Flutter plugin may apply kotlin-android without a compatible Android Gradle plugin or may not yet support the current AGP.',
+                'GitHub API 404: verify the repository owner/name, repository visibility, token access, workflow file location and default branch. Remove spaces from repository names.',
+                'GitHub API 422 with too many properties: this means the dispatch payload shape exceeded a GitHub API limit. Update the Builder and workflow together so the client payload fields match.',
+                'Build says success but no file downloads: open the run and verify artifact upload. If the artifact exists, the problem is after compilation and may be a network, permissions or artifact-fetch issue.',
+                'Use Load build logs for details. Fix one root error, save the project, and rebuild; later errors can be consequences of the first error.',
+              ]),
+              _GuideArticle(title: '12. Safe editing and troubleshooting habits', summary: 'Simple habits that keep projects reliable and easier to recover.', icon: Icons.tips_and_updates_outlined, steps: <String>[
+                'Let the project auto-save after editing, and wait for any save indicator or confirmation before closing the wizard.',
+                'Before applying a starter template, read the confirmation dialog. The template can replace the Dart tree, though native Android files and Android dependencies are preserved.',
+                'Make small changes and build often rather than pasting a large unrelated project all at once. This makes the file or dependency that introduced an error easier to find.',
+                'Import only files you trust. The Builder accepts selected text sources and intentionally skips arbitrary Gradle build scripts and binaries to protect the generated build environment.',
+                'For an important project, verify its private backup repository contains the newest source archive before removing the app or changing accounts.',
+              ]),
+            ];
+          
+            @override
+            void dispose() {
+              _search.dispose();
+              super.dispose();
+            }
+          
+            @override
+            Widget build(BuildContext context) {
+              final query = _query.trim().toLowerCase();
+              final visible = _articles.where((article) => query.isEmpty || article.searchText.contains(query)).toList();
+              return Scaffold(
+                appBar: AppBar(title: const Text('Guides and tutorials')),
+                body: ListView(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 28),
+                  children: [
+                    Card(
+                      child: Padding(
+                        padding: const EdgeInsets.all(16),
+                        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Icon(Icons.menu_book_outlined, size: 32, color: Theme.of(context).colorScheme.primary),
+                          const SizedBox(width: 12),
+                          const Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Text('Step-by-step help, in one place', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
+                            SizedBox(height: 6),
+                            Text('Open a topic to read it from beginning to end. The guides explain where to tap, what to enter, what the app does, and how to troubleshoot problems.'),
+                          ])),
+                        ]),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: _search,
+                      onChanged: (value) => setState(() => _query = value),
+                      decoration: InputDecoration(
+                        prefixIcon: const Icon(Icons.search),
+                        labelText: 'Search guides',
+                        hintText: 'Try Android, icons, GitHub, AAB, Kotlin…',
+                        suffixIcon: _query.isEmpty ? null : IconButton(icon: const Icon(Icons.clear), tooltip: 'Clear search', onPressed: () { _search.clear(); setState(() => _query = ''); }),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Text('${visible.length} guide topic(s)', style: Theme.of(context).textTheme.bodySmall),
+                    const SizedBox(height: 6),
+                    if (visible.isEmpty)
+                      const Card(child: Padding(padding: EdgeInsets.all(20), child: Text('No matching guides. Try a shorter search, such as build, folder, Android, or token.'))),
+                    ...visible.map((article) => Card(
+                      clipBehavior: Clip.antiAlias,
+                      child: ExpansionTile(
+                        leading: Icon(article.icon, color: Theme.of(context).colorScheme.primary),
+                        title: Text(article.title, style: const TextStyle(fontWeight: FontWeight.w600)),
+                        subtitle: Text(article.summary),
+                        expandedCrossAxisAlignment: CrossAxisAlignment.start,
+                        childrenPadding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        children: article.steps.asMap().entries.map((entry) => Padding(
+                          padding: const EdgeInsets.only(top: 10),
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            CircleAvatar(radius: 13, child: Text('${entry.key + 1}', style: const TextStyle(fontSize: 12))),
+                            const SizedBox(width: 10),
+                            Expanded(child: Text(entry.value)),
+                          ]),
+                        )).toList(),
+                      ),
+                    )),
+                  ],
+                ),
+              );
+            }
+          }
+          
           class SetupScreen extends StatefulWidget {
             const SetupScreen({super.key, required this.onSetup});
             final Future<void> Function(GitHubAccount account) onSetup;
@@ -2422,6 +2606,10 @@ jobs:
               if (confirmed == true) await widget.onProjectsChanged(widget.projects.where((p) => p.id != project.id).toList());
             }
           
+            Future<void> _openGuides() async {
+              await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => const GuidesScreen()));
+            }
+          
             Future<void> _settings() async {
               await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => SettingsScreen(
                 accounts: widget.accounts,
@@ -2438,21 +2626,27 @@ jobs:
             Widget build(BuildContext context) => Scaffold(
                   appBar: AppBar(
                     title: const Text('Simple App Builder'),
-                    actions: [IconButton(tooltip: 'Settings and GitHub accounts', onPressed: _settings, icon: const Icon(Icons.settings_outlined))],
+                    actions: [
+                    IconButton(tooltip: 'Detailed guides and tutorials', onPressed: _openGuides, icon: const Icon(Icons.menu_book_outlined)),
+                    IconButton(tooltip: 'Settings and GitHub accounts', onPressed: _settings, icon: const Icon(Icons.settings_outlined)),
+                  ],
                   ),
                   body: widget.projects.isEmpty
-                      ? Center(child: Padding(padding: const EdgeInsets.all(28), child: Column(mainAxisSize: MainAxisSize.min, children: [
+                      ? SingleChildScrollView(child: Padding(padding: const EdgeInsets.all(28), child: Column(mainAxisSize: MainAxisSize.min, children: [
                           Icon(Icons.phone_android_rounded, size: 72, color: Theme.of(context).colorScheme.primary),
                           const SizedBox(height: 18),
                           Text('Build your first app', style: Theme.of(context).textTheme.headlineSmall),
                           const SizedBox(height: 8),
-                          const Text('Create a Flutter project, choose an icon, paste or import Dart code, then build and download a release APK through GitHub Actions.', textAlign: TextAlign.center),
+                          const Text('Create a Flutter project, choose an icon, add Dart or native Android code, then build and download an APK or AAB through GitHub Actions.', textAlign: TextAlign.center),
                           const SizedBox(height: 10),
                           Text(widget.backupStatus, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall),
                           const SizedBox(height: 18),
                           FilledButton.icon(onPressed: () => _openWizard(), icon: const Icon(Icons.add), label: const Text('Create project')),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(onPressed: _openGuides, icon: const Icon(Icons.menu_book_outlined), label: const Text('Read detailed guides')),
                         ])))
                       : ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 92), children: [
+                          Card(child: ListTile(leading: const Icon(Icons.menu_book_outlined), title: const Text('Guides and tutorials'), subtitle: const Text('Step-by-step help for setup, folders, Dart, Android, dependencies, builds, signing and backups.'), trailing: const Icon(Icons.chevron_right), onTap: _openGuides)),
                           Card(child: ListTile(leading: const Icon(Icons.cloud_done_outlined), title: Text(widget.repository.isEmpty ? 'Repository not configured' : widget.repository), subtitle: Text('${widget.accounts.length} GitHub account(s) · ${widget.autoFailover ? 'automatic failover on' : 'automatic failover off'}'), trailing: const Icon(Icons.chevron_right), onTap: _settings)),
                           Card(child: ListTile(leading: const Icon(Icons.backup_outlined), title: const Text('Automatic project backups'), subtitle: Text(widget.backupStatus), isThreeLine: true, onTap: _settings)),
                           const SizedBox(height: 8),
@@ -3025,11 +3219,32 @@ jobs:
               if (imported.length > 250 || totalBytes > 5 * 1024 * 1024 || dartBytes > 2 * 1024 * 1024 || androidBytes > 3 * 1024 * 1024) {
                 throw Exception('Import exceeds the project limits (250 files, 5 MB total, 2 MB Dart and 3 MB Android text).');
               }
-              setState(() {
-                if (imported.containsKey('lib/main.dart')) {
-                  _dartCode = imported.remove('lib/main.dart')!;
+              final existingFiles = _allProjectFiles();
+              final conflicts = imported.keys.where(existingFiles.containsKey).toList()..sort();
+              if (conflicts.isNotEmpty) {
+                final preview = conflicts.take(6).join('\n');
+                final replaceExisting = await showDialog<bool>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: Text('Replace ${conflicts.length} existing file(s)?'),
+                    content: SingleChildScrollView(child: Text('These paths already exist in the project:\n\n$preview${conflicts.length > 6 ? '\n… and ${conflicts.length - 6} more' : ''}\n\nReplacing them will overwrite their current contents.')),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel import')),
+                      FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Replace and import')),
+                    ],
+                  ),
+                );
+                if (replaceExisting != true || !mounted) {
+                  _message('Import canceled. Existing project files were left unchanged.');
+                  return;
                 }
-                _additionalFiles = <String, String>{..._additionalFiles, ...imported}..remove('lib/main.dart');
+              }
+              final importedCount = imported.length;
+              final importedMain = imported['lib/main.dart'];
+              final filesToMerge = Map<String, String>.from(imported)..remove('lib/main.dart');
+              setState(() {
+                if (importedMain != null) _dartCode = importedMain;
+                _additionalFiles = <String, String>{..._additionalFiles, ...filesToMerge}..remove('lib/main.dart');
                 _folders.addAll(_folderAncestors('lib/main.dart'));
                 for (final entry in _additionalFiles.keys) {
                   _folders.addAll(_folderAncestors(entry));
@@ -3038,7 +3253,7 @@ jobs:
                 _selectedTemplate = 'Custom project';
               });
               _scheduleDraftSave();
-              _message('Imported ${imported.length} supported source/configuration file(s) from $sourceName. Unsupported assets and project-wide Gradle files were skipped to protect the generated Android project.');
+              _message('Imported $importedCount supported source/configuration file(s) from $sourceName. Unsupported assets and project-wide Gradle files were skipped to protect the generated Android project.');
             }
           
             Future<void> _importProjectFolder() async {
@@ -3189,6 +3404,17 @@ jobs:
                 if (bytes.isEmpty) throw Exception('The selected file is empty.');
                 if (bytes.length > 1024 * 1024) throw Exception('Android source files are limited to 1 MB each.');
                 final source = utf8.decode(bytes, allowMalformed: false);
+                if (_allProjectFiles().containsKey(normalized)) {
+                  final replaceExisting = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+                    title: const Text('Replace existing file?'),
+                    content: Text('$normalized already exists. Replace its contents with the imported file?'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+                      FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Replace')),
+                    ],
+                  ));
+                  if (replaceExisting != true || !mounted) return;
+                }
                 setState(() {
                   _additionalFiles[normalized] = source;
                   _folders.addAll(_folderAncestors(normalized));
@@ -3201,6 +3427,152 @@ jobs:
                 await _editFile(normalized);
               } catch (error) {
                 _message('Android file import failed: $error');
+              }
+            }
+          
+            Future<void> _addBlankAndroidTemplate() async {
+              final packagePath = _packageName.text.trim().replaceAll('.', '/');
+              final currentIsKotlin = _currentFolder.startsWith('android/app/src/main/kotlin/');
+              final currentIsJava = _currentFolder.startsWith('android/app/src/main/java/');
+              String language = currentIsJava ? 'java' : 'kotlin';
+              final fallbackRoot = language == 'java' ? 'android/app/src/main/java' : 'android/app/src/main/kotlin';
+              final defaultFolder = (currentIsKotlin || currentIsJava) ? _currentFolder : '$fallbackRoot/$packagePath';
+              final folderController = TextEditingController(text: defaultFolder);
+              final result = await showDialog<Map<String, String>>(
+                context: context,
+                builder: (dialogContext) => StatefulBuilder(
+                  builder: (dialogContext, setDialogState) => AlertDialog(
+                    title: const Text('Add empty Android Activity template'),
+                    content: SizedBox(width: 520, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('Creates a blank native Android Activity in the folder you choose and registers it in AndroidManifest.xml. It lives inside this Flutter app’s Android module; it is not a separate standalone Android Studio project, and it does not replace Flutter MainActivity.'),
+                      const SizedBox(height: 14),
+                      DropdownButtonFormField<String>(
+                        value: language,
+                        decoration: const InputDecoration(labelText: 'Native language'),
+                        items: const [DropdownMenuItem(value: 'kotlin', child: Text('Kotlin (.kt)'),), DropdownMenuItem(value: 'java', child: Text('Java (.java)'))],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setDialogState(() {
+                            final oldRoot = language == 'java' ? 'android/app/src/main/java' : 'android/app/src/main/kotlin';
+                            final newRoot = value == 'java' ? 'android/app/src/main/java' : 'android/app/src/main/kotlin';
+                            if (folderController.text == oldRoot || folderController.text.startsWith('$oldRoot/')) {
+                              folderController.text = '$newRoot${folderController.text.substring(oldRoot.length)}';
+                            } else {
+                              folderController.text = '$newRoot/$packagePath';
+                            }
+                            language = value;
+                          });
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(controller: folderController, autofocus: true, autocorrect: false, decoration: const InputDecoration(
+                        labelText: 'Destination folder inside this project',
+                        hintText: 'android/app/src/main/kotlin/com/example/app',
+                        helperText: 'Use a project-relative Kotlin or Java package folder. Missing folders are created automatically.',
+                      )),
+                      if (currentIsKotlin || currentIsJava)
+                        Align(alignment: Alignment.centerLeft, child: TextButton.icon(
+                          onPressed: () => setDialogState(() => folderController.text = _currentFolder),
+                          icon: const Icon(Icons.folder_open_outlined), label: const Text('Use folder currently open'),
+                        )),
+                    ])),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+                      FilledButton.icon(onPressed: () => Navigator.pop(dialogContext, {'language': language, 'folder': folderController.text.trim()}), icon: const Icon(Icons.download_done_outlined), label: const Text('Add template')),
+                    ],
+                  ),
+                ),
+              );
+              folderController.dispose();
+              if (result == null || !mounted) return;
+          
+              try {
+                final kind = result['language'] == 'java' ? 'java' : 'kotlin';
+                final root = kind == 'java' ? 'android/app/src/main/java' : 'android/app/src/main/kotlin';
+                final folder = result['folder']!.replaceAll('\\', '/').replaceAll(RegExp(r'/+'), '/').replaceAll(RegExp(r'^/+|/+$'), '');
+                if (!_isSafeFolderPath(folder) || !folder.startsWith('$root/')) {
+                  throw Exception('Choose a destination under $root/, for example $root/${_packageName.text.trim().replaceAll('.', '/')}.');
+                }
+                final packageName = folder.substring(root.length + 1).replaceAll('/', '.');
+                if (!RegExp(r'^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$').hasMatch(packageName)) {
+                  throw Exception('Each folder after the Kotlin/Java root must be a valid package segment made of letters, digits, and underscores.');
+                }
+          
+                var className = 'NativeTemplateActivity';
+                var suffix = 2;
+                String extension() => kind == 'java' ? '.java' : '.kt';
+                while (_allProjectFiles().containsKey('$folder/$className${extension()}')) {
+                  className = 'NativeTemplateActivity$suffix';
+                  suffix++;
+                }
+                final activityPath = '$folder/$className${extension()}';
+                final fullClassName = '$packageName.$className';
+                final source = kind == 'kotlin'
+                    ? '''package $packageName
+          
+          import android.app.Activity
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.widget.FrameLayout
+          
+          /**
+           * Blank native Android Activity template created by Simple App Builder.
+           * This is a separate Activity, not Flutter's generated MainActivity.
+           */
+          class $className : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(FrameLayout(this).apply {
+                      setBackgroundColor(Color.WHITE)
+                  })
+              }
+          }
+          '''
+                    : '''package $packageName;
+          
+          import android.app.Activity;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.widget.FrameLayout;
+          
+          /** Blank native Android Activity template created by Simple App Builder. */
+          public class $className extends Activity {
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  FrameLayout root = new FrameLayout(this);
+                  root.setBackgroundColor(Color.WHITE);
+                  setContentView(root);
+              }
+          }
+          ''';
+          
+                const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+                final activityTag = '    <activity android:name="$fullClassName" android:exported="false" />';
+                var manifest = _additionalFiles[manifestPath] ?? '''<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application>
+              </application>
+          </manifest>
+          ''';
+                if (!manifest.contains(fullClassName)) {
+                  final closingTag = RegExp(r'</application\s*>', caseSensitive: false);
+                  if (!closingTag.hasMatch(manifest)) {
+                    throw Exception('The existing custom AndroidManifest.xml has no closing </application> tag. Fix that file first, then add the template again.');
+                  }
+                  manifest = manifest.replaceFirst(closingTag, '$activityTag\n</application>');
+                }
+                setState(() {
+                  _additionalFiles[activityPath] = source;
+                  _additionalFiles[manifestPath] = manifest;
+                  _folders.addAll(_folderAncestors(activityPath));
+                  _folders.addAll(_folderAncestors(manifestPath));
+                  _selectedTemplate = 'Custom project';
+                  _currentFolder = folder;
+                });
+                _scheduleDraftSave();
+                _message('Added $className and registered it in AndroidManifest.xml. Select the new file to edit it.');
+              } catch (error) {
+                _message('Could not add Android template: $error');
               }
             }
           
@@ -3323,6 +3695,28 @@ jobs:
           
           
           
+            void _removeManifestEntriesForNativeSources(Iterable<MapEntry<String, String>> removedSources) {
+              const manifestPath = 'android/app/src/main/AndroidManifest.xml';
+              final original = _additionalFiles[manifestPath];
+              if (original == null || removedSources.isEmpty) return;
+              var manifest = original;
+              for (final entry in removedSources) {
+                final path = entry.key;
+                if (!path.endsWith('.kt') && !path.endsWith('.java')) continue;
+                final className = path.split('/').last.replaceFirst(RegExp(r'\.(?:kt|java)$'), '');
+                if (!RegExp(r'\b(?:class|object)\s+' + RegExp.escape(className) + r'\b').hasMatch(entry.value)) continue;
+                final packageName = RegExp(r'(?m)^\s*package\s+([A-Za-z_][A-Za-z0-9_.]*)\s*;?\s*$')
+                    .firstMatch(entry.value)?.group(1);
+                if (packageName == null) continue;
+                final names = '(?:${RegExp.escape('$packageName.$className')}|\\.${RegExp.escape(className)}|${RegExp.escape(className)})';
+                // Remove generated/self-closing activity declarations for the deleted source.
+                // Other application manifest content remains unchanged.
+                final expression = "<activity\\b(?=[^>]*\\bandroid:name\\s*=\\s*[\"']$names[\"'])[^>]*/\\s*>";
+                manifest = manifest.replaceAll(RegExp(expression, caseSensitive: false, dotAll: true), '');
+              }
+              if (manifest != original) _additionalFiles[manifestPath] = manifest;
+            }
+          
             Future<void> _removeFile(String path) async {
               // lib/main.dart is the required Flutter entry point and cannot be removed.
               if (path == 'lib/main.dart') {
@@ -3346,13 +3740,17 @@ jobs:
               );
               if (confirmed != true || !mounted) return;
               setState(() {
+                final removedSource = _additionalFiles[path];
+                if (removedSource != null) {
+                  _removeManifestEntriesForNativeSources([MapEntry<String, String>(path, removedSource)]);
+                }
                 _additionalFiles.remove(path);
                 _selectedTemplate = 'Custom project';
               });
               _scheduleDraftSave();
               _message('Deleted ${path.split('/').last}.');
             }
-
+          
             Future<void> _createFolder({String? initialPath}) async {
               final controller = TextEditingController(text: initialPath ?? '');
               final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
@@ -3388,6 +3786,11 @@ jobs:
           
             Future<void> _renameFolder(String oldPath) async {
               if (oldPath == 'lib' || oldPath == 'android') { _message('The top-level project folders cannot be renamed.'); return; }
+              final containsNativeSources = _additionalFiles.keys.any((file) => file.startsWith('$oldPath/') && (file.endsWith('.kt') || file.endsWith('.java')));
+              if ((oldPath.startsWith('android/app/src/main/kotlin/') || oldPath.startsWith('android/app/src/main/java/') || oldPath == 'android/app/src/main/kotlin' || oldPath == 'android/app/src/main/java') && containsNativeSources) {
+                _message('This folder contains native Android code. Renaming a package folder can break package declarations and AndroidManifest.xml. Keep its name aligned with the package, or update the source package and manifest references first. No files were changed.');
+                return;
+              }
                         final oldSlash = oldPath.lastIndexOf('/');
                         final oldParent = oldSlash < 0 ? '' : oldPath.substring(0, oldSlash);
               final controller = TextEditingController(text: oldPath.split('/').last);
@@ -3437,6 +3840,11 @@ jobs:
               ));
               if (confirmed != true) return;
               setState(() {
+                final removedNativeSources = _additionalFiles.entries
+                    .where((entry) => entry.key.startsWith('$path/') && (entry.key.endsWith('.kt') || entry.key.endsWith('.java')))
+                    .map((entry) => MapEntry<String, String>(entry.key, entry.value))
+                    .toList();
+                _removeManifestEntriesForNativeSources(removedNativeSources);
                 _additionalFiles.removeWhere((file, _) => file.startsWith('$path/'));
                 _folders.removeWhere((folder) => folder == path || folder.startsWith('$path/'));
                 if (_currentFolder == path || _currentFolder.startsWith('$path/')) {
@@ -4032,9 +4440,10 @@ jobs:
                         OutlinedButton.icon(onPressed: _building ? null : _importProjectFolder, icon: const Icon(Icons.folder_open), label: const Text('Import project folder')),
                         OutlinedButton.icon(onPressed: _building ? null : _importProjectZip, icon: const Icon(Icons.archive_outlined), label: const Text('Import ZIP')),
                         OutlinedButton.icon(onPressed: _building ? null : _importAndroidFile, icon: const Icon(Icons.android), label: const Text('Import Android source')),
+                        FilledButton.tonalIcon(onPressed: _building ? null : _addBlankAndroidTemplate, icon: const Icon(Icons.add_box_outlined), label: const Text('Add blank Android template')),
                       ]),
                       const SizedBox(height: 6),
-                      const Text('Folder/ZIP import preserves supported Dart and Android source paths. Binary Android assets, Gradle scripts and a custom pubspec.yaml are skipped to protect generated build configuration. Android XML manifests are merged with Flutter’s manifest.', style: TextStyle(fontSize: 12)),
+                        const Text('Folder/ZIP import preserves supported Dart and Android source paths. Binary Android assets, Gradle scripts and a custom pubspec.yaml are skipped to protect generated build configuration. Android XML manifests are merged with Flutter’s manifest. Use Add blank Android template for a ready-to-edit native Activity scaffold in a folder you choose.', style: TextStyle(fontSize: 12)),
                       const SizedBox(height: 14),
                       TextField(
                         controller: _dependencies,
