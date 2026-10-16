@@ -1,6 +1,6 @@
 name: Build Simple App Builder or a Flutter project
 
-# The manual GitHub Actions run installs/builds only the builder APK; app requests build APK, AAB, or a Flutter Web preview.
+# Manual runs build the Simple App Builder APK. App requests build an APK or AAB.
 # A project created inside the app triggers repository_dispatch with a per-build payload.
 run-name: ${{ github.event.client_payload.request_id || 'Build Simple App Builder' }}
 on:
@@ -22,20 +22,67 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
+      - name: Normalize dynamic app-build payload
+        id: app_payload
+        if: ${{ github.event_name == 'repository_dispatch' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, uuid
+          from pathlib import Path
+          event_path = Path(os.environ['GITHUB_EVENT_PATH'])
+          event = json.loads(event_path.read_text(encoding='utf-8'))
+          payload = event.get('client_payload') or {}
+          if not isinstance(payload, dict):
+              raise SystemExit('GitHub dispatch client_payload must be a JSON object.')
+          icon = payload.get('icon') if isinstance(payload.get('icon'), dict) else {}
+          options = payload.get('options') if isinstance(payload.get('options'), dict) else {}
+          # Prefer the current flat format while allowing earlier nested payloads.
+          values = {
+              'project_name': payload.get('project_name', ''),
+              'package_name': payload.get('package_name', ''),
+              'dependencies': payload.get('dependencies', ''),
+              'dart_code': payload.get('dart_code', ''),
+              'source_archive_base64': payload.get('source_archive_base64', ''),
+              'has_custom_icon': payload.get('has_custom_icon', icon.get('custom', False)),
+              'icon_path': payload.get('icon_path', icon.get('path', '')),
+              'dynamic_themed_icon': payload.get('dynamic_themed_icon', options.get('dynamic_themed_icon', True)),
+              'build_format': payload.get('build_format', options.get('build_format', 'apk')),
+              'sign_release': payload.get('sign_release', options.get('sign_release', False)),
+              'request_id': payload.get('request_id', ''),
+          }
+          output_path = Path(os.environ['GITHUB_OUTPUT'])
+          with output_path.open('a', encoding='utf-8') as output:
+              for key, raw_value in values.items():
+                  if isinstance(raw_value, bool):
+                      value = str(raw_value).lower()
+                  elif raw_value is None:
+                      value = ''
+                  else:
+                      value = str(raw_value)
+                  delimiter = 'SAB_' + uuid.uuid4().hex
+                  while delimiter in value:
+                      delimiter = 'SAB_' + uuid.uuid4().hex
+                  output.write(f'{key}<<{delimiter}\n{value}\n{delimiter}\n')
+          print('Normalized app-build payload using the flat schema (legacy nested fields remain supported).')
+          PY
+
       - name: Validate generated-app request
+
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
-          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
-          DART_CODE: ${{ github.event.client_payload.dart_code }}
-          SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
-          DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
-          HAS_CUSTOM_ICON: ${{ github.event.client_payload.icon.custom }}
-          ICON_PATH: ${{ github.event.client_payload.icon.path }}
-          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.options.dynamic_themed_icon }}
-          BUILD_FORMAT: ${{ github.event.client_payload.options.build_format }}
-          SIGN_RELEASE: ${{ github.event.client_payload.options.sign_release }}
+          PROJECT_NAME: ${{ steps.app_payload.outputs.project_name }}
+          PACKAGE_NAME: ${{ steps.app_payload.outputs.package_name }}
+          DART_CODE: ${{ steps.app_payload.outputs.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ steps.app_payload.outputs.source_archive_base64 }}
+          DEPENDENCIES: ${{ steps.app_payload.outputs.dependencies }}
+          HAS_CUSTOM_ICON: ${{ steps.app_payload.outputs.has_custom_icon }}
+          ICON_PATH: ${{ steps.app_payload.outputs.icon_path }}
+          DYNAMIC_THEMED_ICON: ${{ steps.app_payload.outputs.dynamic_themed_icon }}
+          BUILD_FORMAT: ${{ steps.app_payload.outputs.build_format }}
+          SIGN_RELEASE: ${{ steps.app_payload.outputs.sign_release }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -66,8 +113,8 @@ jobs:
           if (os.environ.get('DYNAMIC_THEMED_ICON', '').lower() or 'true') not in ('true', 'false'):
               sys.exit('dynamic_themed_icon must be true or false.')
           output_format = (os.environ.get('BUILD_FORMAT', '').strip().lower() or 'apk')
-          if output_format not in ('apk', 'aab', 'web_preview'):
-              sys.exit('build_format must be apk, aab, or web_preview.')
+          if output_format not in ('apk', 'aab'):
+              sys.exit('build_format must be apk or aab.')
           if (os.environ.get('SIGN_RELEASE', '').strip().lower() or 'false') not in ('true', 'false'):
               sys.exit('sign_release must be true or false.')
           if len(source.encode('utf-8')) > 50000:
@@ -83,7 +130,7 @@ jobs:
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
+          PROJECT_NAME: ${{ steps.app_payload.outputs.project_name }}
         run: |
           set -euo pipefail
           slug="$(printf '%s' "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
@@ -114,7 +161,7 @@ jobs:
         id: gradle-cache-key
         shell: bash
         env:
-          EXTRA_DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
+          EXTRA_DEPENDENCIES: ${{ steps.app_payload.outputs.dependencies }}
         run: |
           set -euo pipefail
           # Key Gradle cache by the actual imported pub package names, not the full
@@ -168,7 +215,6 @@ jobs:
           project = Path(sys.argv[1])
           app_label = sys.argv[2]
           application_id = sys.argv[3]
-          allow_local_preview = len(sys.argv) > 4 and sys.argv[4].lower() == 'true'
           manifest = project / 'android/app/src/main/AndroidManifest.xml'
           android_ns = 'http://schemas.android.com/apk/res/android'
           ET.register_namespace('android', android_ns)
@@ -178,8 +224,6 @@ jobs:
           if app is None:
               raise SystemExit(f'No <application> element in {manifest}')
           app.set(f'{{{android_ns}}}label', app_label)
-          if allow_local_preview:
-              app.set(f'{{{android_ns}}}usesCleartextTraffic', 'true')
           internet = f'{{{android_ns}}}name'
           if not any(node.tag == 'uses-permission' and node.get(internet) == 'android.permission.INTERNET' for node in root):
               permission = ET.Element('uses-permission')
@@ -392,7 +436,7 @@ jobs:
           # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
           # selected above supplies the current compatible SDK. cross_file 0.3.x is required
           # by both plugins; do not let Pub select the incompatible 0.4.x line.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0 webview_flutter:^4.13.0
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0 crypto
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
@@ -412,7 +456,7 @@ jobs:
                   raise SystemExit(f'Could not pin {package} in pubspec.yaml')
           pubspec.write_text(text, encoding='utf-8')
           PYDEPS
-          python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE" true
+          python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE"
           cat > lib/main.dart <<'DART'
           import 'dart:async';
           import 'dart:convert';
@@ -437,7 +481,8 @@ jobs:
           import 'package:share_plus/share_plus.dart';
           import 'package:shared_preferences/shared_preferences.dart';
           import 'package:url_launcher/url_launcher.dart';
-          import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:crypto/crypto.dart' as crypto;
+          import 'dart:math' as math;
 
           const String compiledRepository = String.fromEnvironment(
             'BUILDER_REPOSITORY',
@@ -487,6 +532,7 @@ jobs:
               this.dynamicThemedIcon = true,
               this.buildFormat = 'apk',
               this.signRelease = false,
+              this.updatedAtMillis = 0,
             });
 
             final String id;
@@ -504,6 +550,7 @@ jobs:
             final String repository;
             final String buildFormat;
             final bool signRelease;
+            final int updatedAtMillis;
 
             AppProject copyWith({
               String? name,
@@ -517,6 +564,7 @@ jobs:
               bool? dynamicThemedIcon,
               String? buildFormat,
               bool? signRelease,
+              int? updatedAtMillis,
               bool clearIcon = false,
             }) => AppProject(
                   id: id,
@@ -531,6 +579,7 @@ jobs:
                   dynamicThemedIcon: dynamicThemedIcon ?? this.dynamicThemedIcon,
                   buildFormat: buildFormat ?? this.buildFormat,
                   signRelease: signRelease ?? this.signRelease,
+                  updatedAtMillis: updatedAtMillis ?? this.updatedAtMillis,
                 );
 
             Map<String, dynamic> toJson() => {
@@ -546,6 +595,7 @@ jobs:
                   'dynamicThemedIcon': dynamicThemedIcon,
                   'buildFormat': buildFormat,
                   'signRelease': signRelease,
+                  'updatedAtMillis': updatedAtMillis,
                 };
 
             factory AppProject.fromJson(Map<String, dynamic> json) {
@@ -581,8 +631,89 @@ jobs:
                 dynamicThemedIcon: json['dynamicThemedIcon'] is bool ? json['dynamicThemedIcon'] as bool : true,
                 buildFormat: (json['buildFormat'] ?? 'apk').toString() == 'aab' ? 'aab' : 'apk',
                 signRelease: json['signRelease'] is bool ? json['signRelease'] as bool : false,
+                updatedAtMillis: (json['updatedAtMillis'] as num?)?.toInt() ?? 0,
               );
             }
+          }
+
+          const String _backupRepositoryPrefix = 'backup_456';
+          const String _backupFolder = '.simple-app-builder/backups';
+
+          String _backupFileNameForProject(AppProject project) =>
+              '${base64Url.encode(utf8.encode(project.id)).replaceAll('=', '')}.zip';
+
+          Uint8List _encodeProjectBackup(AppProject project) {
+            final backup = Archive();
+            final metadata = project.toJson()
+              ..remove('dartCode')
+              ..remove('additionalFiles')
+              ..remove('folders')
+              ..remove('iconBase64');
+            final metadataBytes = Uint8List.fromList(utf8.encode(jsonEncode(metadata)));
+            backup.addFile(ArchiveFile('project.json', metadataBytes.length, metadataBytes));
+            final mainBytes = Uint8List.fromList(utf8.encode(project.dartCode));
+            backup.addFile(ArchiveFile('lib/main.dart', mainBytes.length, mainBytes));
+            for (final entry in project.additionalFiles.entries) {
+              if (!_isSafeDartPath(entry.key) || entry.key == 'lib/main.dart') continue;
+              final bytes = Uint8List.fromList(utf8.encode(entry.value));
+              backup.addFile(ArchiveFile(entry.key, bytes.length, bytes));
+            }
+            final folderBytes = Uint8List.fromList(utf8.encode(jsonEncode(project.folders.toList()..sort())));
+            backup.addFile(ArchiveFile('folders.json', folderBytes.length, folderBytes));
+            if (project.iconBase64 != null && project.iconBase64!.isNotEmpty) {
+              try {
+                final iconBytes = base64Decode(project.iconBase64!);
+                if (iconBytes.isNotEmpty && iconBytes.length <= 8 * 1024 * 1024) {
+                  backup.addFile(ArchiveFile('project-icon.png', iconBytes.length, iconBytes));
+                }
+              } catch (_) {}
+            }
+            return Uint8List.fromList(ZipEncoder().encode(backup));
+          }
+
+          AppProject? _decodeProjectBackup(Uint8List bytes) {
+            try {
+              final archive = ZipDecoder().decodeBytes(bytes, verify: true);
+              ArchiveFile? metadataEntry;
+              ArchiveFile? folderEntry;
+              ArchiveFile? iconEntry;
+              final dartFiles = <String, String>{};
+              for (final entry in archive.files) {
+                if (!entry.isFile) continue;
+                final path = entry.name.replaceAll('\\', '/');
+                if (path.startsWith('/') || path.split('/').any((part) => part == '.' || part == '..' || part.isEmpty)) continue;
+                if (path == 'project.json') metadataEntry = entry;
+                else if (path == 'folders.json') folderEntry = entry;
+                else if (path == 'project-icon.png') iconEntry = entry;
+                else if (_isSafeDartPath(path)) {
+                  dartFiles[path] = utf8.decode(entry.content as List<int>, allowMalformed: true);
+                }
+              }
+              if (metadataEntry == null || !dartFiles.containsKey('lib/main.dart')) return null;
+              final metadata = jsonDecode(utf8.decode(metadataEntry.content as List<int>)) as Map<String, dynamic>;
+              final folders = <String>{};
+              if (folderEntry != null) {
+                final raw = jsonDecode(utf8.decode(folderEntry.content as List<int>));
+                if (raw is List) for (final folder in raw) {
+                  final value = folder.toString();
+                  if (_isSafeFolderPath(value)) folders.add(value);
+                }
+              }
+              for (final path in dartFiles.keys) { folders.addAll(_folderAncestors(path)); }
+              metadata['dartCode'] = dartFiles.remove('lib/main.dart') ?? '';
+              metadata['additionalFiles'] = dartFiles;
+              metadata['folders'] = folders.toList();
+              if (iconEntry != null) metadata['iconBase64'] = base64Encode(iconEntry.content as List<int>);
+              return AppProject.fromJson(metadata);
+            } catch (_) {
+              return null;
+            }
+          }
+
+          Map<String, dynamic> _projectComparable(AppProject project) {
+            final result = project.toJson();
+            result.remove('updatedAtMillis');
+            return result;
           }
 
           // Templates are starting points, not fixed generated apps. Users can change
@@ -596,16 +727,15 @@ jobs:
           void main() => runApp(const MyApp());
 
           class MyApp extends StatelessWidget {
-          const MyApp({super.key});
-
-          @override
-          Widget build(BuildContext context) => MaterialApp(
-          title: 'My App',
-          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
-          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.dark),
-          themeMode: ThemeMode.system,
-          home: const Scaffold(body: SizedBox.shrink()),
-          );
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              title: 'My App',
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+              darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.dark),
+              themeMode: ThemeMode.system,
+              home: const Scaffold(body: SizedBox.shrink()),
+            );
           }
           ''',
                 };
@@ -616,75 +746,255 @@ jobs:
           void main() => runApp(const CounterApp());
 
           class CounterApp extends StatelessWidget {
-          const CounterApp({super.key});
-          @override
-          Widget build(BuildContext context) => MaterialApp(
-          title: 'Counter',
-          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
-          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal, brightness: Brightness.dark),
-          themeMode: ThemeMode.system,
-          home: const CounterScreen(),
-          );
+            const CounterApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              title: 'Counter',
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
+              darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal, brightness: Brightness.dark),
+              themeMode: ThemeMode.system,
+              home: const CounterScreen(),
+            );
           }
 
           class CounterScreen extends StatefulWidget {
-          const CounterScreen({super.key});
-          @override
-          State<CounterScreen> createState() => _CounterScreenState();
+            const CounterScreen({super.key});
+            @override
+            State<CounterScreen> createState() => _CounterScreenState();
           }
 
           class _CounterScreenState extends State<CounterScreen> {
-          int count = 0;
-          @override
-          Widget build(BuildContext context) => Scaffold(
-          appBar: AppBar(title: const Text('Counter')),
-          body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-          const Text('You have pressed the button this many times:'),
-          Text('\$count', style: Theme.of(context).textTheme.displayMedium),
-          ])),
-          floatingActionButton: FloatingActionButton(
-          onPressed: () => setState(() => count++),
-          child: const Icon(Icons.add),
-          ),
-          );
+            int count = 0;
+            @override
+            Widget build(BuildContext context) => Scaffold(
+              appBar: AppBar(title: const Text('Counter')),
+              body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                const Text('You have pressed the button this many times:'),
+                Text(count.toString(), style: Theme.of(context).textTheme.displayMedium),
+              ])),
+              floatingActionButton: FloatingActionButton(
+                onPressed: () => setState(() => count++),
+                child: const Icon(Icons.add),
+              ),
+            );
           }
           ''',
                 };
-              default: // Material 3 starter uses a real multi-file lib/ structure.
+              default: // A useful, multi-screen Material 3 starter instead of a placeholder.
                 return {
                   'lib/main.dart': '''import 'package:flutter/material.dart';
-          import 'screens/home_screen.dart';
+          import 'screens/app_shell.dart';
 
-          void main() => runApp(const MyApp());
+          void main() => runApp(const StarterApp());
 
-          class MyApp extends StatelessWidget {
-          const MyApp({super.key});
-
-          @override
-          Widget build(BuildContext context) => MaterialApp(
-          title: 'My App',
-          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
-          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.dark),
-          themeMode: ThemeMode.system,
-          home: const HomeScreen(),
-          );
+          class StarterApp extends StatelessWidget {
+            const StarterApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              const seed = Color(0xFF6750A4);
+              return MaterialApp(
+                title: 'My Workspace',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(useMaterial3: true, colorScheme: ColorScheme.fromSeed(seedColor: seed)),
+                darkTheme: ThemeData(useMaterial3: true, colorScheme: ColorScheme.fromSeed(seedColor: seed, brightness: Brightness.dark)),
+                themeMode: ThemeMode.system,
+                home: const AppShell(),
+              );
+            }
           }
           ''',
-                  'lib/screens/home_screen.dart': '''import 'package:flutter/material.dart';
+                  'lib/screens/app_shell.dart': '''import 'package:flutter/material.dart';
+          import 'dashboard_screen.dart';
+          import 'projects_screen.dart';
+          import 'settings_screen.dart';
 
-          class HomeScreen extends StatelessWidget {
-          const HomeScreen({super.key});
+          class AppShell extends StatefulWidget {
+            const AppShell({super.key});
+            @override
+            State<AppShell> createState() => _AppShellState();
+          }
 
-          @override
-          Widget build(BuildContext context) => Scaffold(
-          appBar: AppBar(title: const Text('My App')),
-          body: const Center(
-          child: Padding(
-            padding: EdgeInsets.all(24),
-            child: Text('Your project is ready. Edit this screen or add new Dart files in the project file tree.'),
-          ),
-          ),
-          );
+          class _AppShellState extends State<AppShell> {
+            int _index = 0;
+            final _titles = const ['Overview', 'Projects', 'Settings'];
+            final _pages = const [DashboardScreen(), ProjectsScreen(), SettingsScreen()];
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+              appBar: AppBar(
+                title: Text(_titles[_index]),
+                actions: [IconButton(
+                  tooltip: 'About this starter',
+                  icon: const Icon(Icons.info_outline),
+                  onPressed: () => showAboutDialog(
+                    context: context,
+                    applicationName: 'My Workspace',
+                    applicationVersion: '1.0.0',
+                    children: const [Text('A multi-screen Flutter starter. Replace sample content with your own app.')],
+                  ),
+                )],
+              ),
+              body: IndexedStack(index: _index, children: _pages),
+              bottomNavigationBar: NavigationBar(
+                selectedIndex: _index,
+                onDestinationSelected: (value) => setState(() => _index = value),
+                destinations: const [
+                  NavigationDestination(icon: Icon(Icons.dashboard_outlined), selectedIcon: Icon(Icons.dashboard), label: 'Overview'),
+                  NavigationDestination(icon: Icon(Icons.folder_outlined), selectedIcon: Icon(Icons.folder), label: 'Projects'),
+                  NavigationDestination(icon: Icon(Icons.settings_outlined), selectedIcon: Icon(Icons.settings), label: 'Settings'),
+                ],
+              ),
+            );
+          }
+          ''',
+                  'lib/screens/dashboard_screen.dart': '''import 'package:flutter/material.dart';
+
+          class DashboardScreen extends StatelessWidget {
+            const DashboardScreen({super.key});
+            void _message(BuildContext context, String message) => ScaffoldMessenger.of(context)
+              ..hideCurrentSnackBar()
+              ..showSnackBar(SnackBar(content: Text(message)));
+
+            Widget _stat(BuildContext context, IconData icon, String label, String value, Color color) => SizedBox(
+              width: 156,
+              child: Card(child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Icon(icon, color: color, size: 26),
+                  const SizedBox(height: 18),
+                  Text(value, style: Theme.of(context).textTheme.headlineMedium),
+                  const SizedBox(height: 4),
+                  Text(label, style: Theme.of(context).textTheme.bodyMedium),
+                ]),
+              )),
+            );
+
+            @override
+            Widget build(BuildContext context) {
+              final color = Theme.of(context).colorScheme;
+              return ListView(padding: const EdgeInsets.all(16), children: [
+                Card(color: color.primaryContainer, child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    Icon(Icons.waving_hand_outlined, size: 30, color: color.onPrimaryContainer),
+                    const SizedBox(height: 14),
+                    Text('Welcome to your workspace', style: Theme.of(context).textTheme.headlineSmall?.copyWith(color: color.onPrimaryContainer)),
+                    const SizedBox(height: 8),
+                    Text('A working multi-screen starting point. Customize screens, colors and actions for your idea.', style: TextStyle(color: color.onPrimaryContainer)),
+                    const SizedBox(height: 16),
+                    FilledButton.tonalIcon(onPressed: () => _message(context, 'Open Projects or edit lib/screens/dashboard_screen.dart to get started.'), icon: const Icon(Icons.arrow_forward), label: const Text('Get started')),
+                  ]),
+                )),
+                const SizedBox(height: 12),
+                Text('At a glance', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 8),
+                Wrap(spacing: 8, runSpacing: 8, children: [
+                  _stat(context, Icons.folder_open, 'Projects', '3', color.primary),
+                  _stat(context, Icons.task_alt, 'Tasks done', '12', color.tertiary),
+                  _stat(context, Icons.bolt_outlined, 'Quick actions', '4', color.secondary),
+                ]),
+                const SizedBox(height: 18),
+                Text('Quick actions', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 8),
+                Card(child: Column(children: [
+                  ListTile(leading: const CircleAvatar(child: Icon(Icons.add_task)), title: const Text('Create a task'), subtitle: const Text('Add your next item'), trailing: const Icon(Icons.chevron_right), onTap: () => _message(context, 'Connect this action to your task flow.')),
+                  const Divider(height: 1),
+                  ListTile(leading: const CircleAvatar(child: Icon(Icons.folder_copy_outlined)), title: const Text('Manage projects'), subtitle: const Text('Open the Projects tab'), trailing: const Icon(Icons.chevron_right), onTap: () => _message(context, 'Choose Projects in the bottom navigation.')),
+                  const Divider(height: 1),
+                  ListTile(leading: const CircleAvatar(child: Icon(Icons.palette_outlined)), title: const Text('Customize appearance'), subtitle: const Text('Follows system light and dark mode'), trailing: const Icon(Icons.chevron_right), onTap: () => _message(context, 'Edit the theme in lib/main.dart.')),
+                ])),
+                const SizedBox(height: 18),
+                Text('Recent activity', style: Theme.of(context).textTheme.titleLarge),
+                const SizedBox(height: 8),
+                const Card(child: Column(children: [
+                  ListTile(leading: Icon(Icons.check_circle_outline), title: Text('Workspace created'), subtitle: Text('Your app is ready to customize'), trailing: Text('Now')),
+                  Divider(height: 1),
+                  ListTile(leading: Icon(Icons.auto_awesome_outlined), title: Text('Material 3 enabled'), subtitle: Text('Adaptive light and dark themes')),
+                  Divider(height: 1),
+                  ListTile(leading: Icon(Icons.widgets_outlined), title: Text('Sample screens added'), subtitle: Text('Overview, Projects and Settings')),
+                ])),
+              ]);
+            }
+          }
+          ''',
+                  'lib/screens/projects_screen.dart': '''import 'package:flutter/material.dart';
+
+          class ProjectsScreen extends StatefulWidget {
+            const ProjectsScreen({super.key});
+            @override
+            State<ProjectsScreen> createState() => _ProjectsScreenState();
+          }
+
+          class _ProjectsScreenState extends State<ProjectsScreen> {
+            final List<String> _projects = ['Website redesign', 'Mobile app', 'Personal goals'];
+            final Set<String> _starred = {};
+
+            Future<void> _addProject() async {
+              final controller = TextEditingController();
+              final name = await showDialog<String>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('New project'),
+                  content: TextField(controller: controller, autofocus: true, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'e.g. New website'), onSubmitted: (value) => Navigator.pop(context, value.trim())),
+                  actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('Create'))],
+                ),
+              );
+              controller.dispose();
+              if (!mounted || name == null || name.isEmpty) return;
+              setState(() => _projects.insert(0, name));
+            }
+
+            @override
+            Widget build(BuildContext context) => ListView(padding: const EdgeInsets.all(16), children: [
+              Row(children: [Expanded(child: Text('Your projects', style: Theme.of(context).textTheme.headlineSmall)), FilledButton.icon(onPressed: _addProject, icon: const Icon(Icons.add), label: const Text('New'))]),
+              const SizedBox(height: 8),
+              Text('Sample data is stored in memory in this starter. Connect local storage or a backend for persistence.', style: Theme.of(context).textTheme.bodySmall),
+              const SizedBox(height: 12),
+              if (_projects.isEmpty) const Card(child: Padding(padding: EdgeInsets.all(24), child: Center(child: Text('No projects yet. Create your first project.')))),
+              ..._projects.map((name) => Card(child: ListTile(
+                leading: const CircleAvatar(child: Icon(Icons.folder_outlined)),
+                title: Text(name),
+                subtitle: Text(_starred.contains(name) ? 'Starred project' : 'Tap the star to pin this project'),
+                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(tooltip: _starred.contains(name) ? 'Unstar' : 'Star', icon: Icon(_starred.contains(name) ? Icons.star : Icons.star_outline), onPressed: () => setState(() { if (!_starred.add(name)) _starred.remove(name); })),
+                  PopupMenuButton<String>(onSelected: (value) { if (value == 'delete') setState(() { _projects.remove(name); _starred.remove(name); }); }, itemBuilder: (_) => const [PopupMenuItem(value: 'delete', child: Text('Delete'))]),
+                ]),
+              ))),
+            ]);
+          }
+          ''',
+                  'lib/screens/settings_screen.dart': '''import 'package:flutter/material.dart';
+
+          class SettingsScreen extends StatefulWidget {
+            const SettingsScreen({super.key});
+            @override
+            State<SettingsScreen> createState() => _SettingsScreenState();
+          }
+
+          class _SettingsScreenState extends State<SettingsScreen> {
+            bool _notifications = true;
+            bool _compactLayout = false;
+
+            @override
+            Widget build(BuildContext context) => ListView(padding: const EdgeInsets.all(16), children: [
+              Text('Preferences', style: Theme.of(context).textTheme.headlineSmall),
+              const SizedBox(height: 12),
+              Card(child: Column(children: [
+                SwitchListTile(value: _notifications, onChanged: (value) => setState(() => _notifications = value), secondary: const Icon(Icons.notifications_outlined), title: const Text('Notifications'), subtitle: const Text('Example interactive setting')),
+                const Divider(height: 1),
+                SwitchListTile(value: _compactLayout, onChanged: (value) => setState(() => _compactLayout = value), secondary: const Icon(Icons.view_agenda_outlined), title: const Text('Compact layout'), subtitle: const Text('Example preference; wire into your UI as needed')),
+              ])),
+              const SizedBox(height: 16),
+              Card(child: Column(children: [
+                const ListTile(leading: Icon(Icons.palette_outlined), title: Text('Color and theme'), subtitle: Text('Uses Material 3; follows system light or dark mode'), trailing: Icon(Icons.chevron_right)),
+                const Divider(height: 1),
+                const ListTile(leading: Icon(Icons.security_outlined), title: Text('Privacy'), subtitle: Text('Add your own privacy details here')),
+                const Divider(height: 1),
+                ListTile(leading: const Icon(Icons.info_outline), title: const Text('About'), subtitle: const Text('My Workspace · 1.0.0'), onTap: () => showAboutDialog(context: context, applicationName: 'My Workspace', applicationVersion: '1.0.0')),
+              ])),
+              const SizedBox(height: 16),
+              Text('This is sample content for a starting point, not a finished product for a specific business. Replace sample screens and connect persistence or APIs for your own app.', style: Theme.of(context).textTheme.bodySmall),
+            ]);
           }
           ''',
                 };
@@ -734,9 +1044,33 @@ jobs:
             String toString() => message;
           }
 
-          String normalizeRepository(String value) => value.trim().replaceAll(RegExp(r'\s*/\s*'), '/');
+          String normalizeRepository(String value) {
+            var normalized = value.trim();
+            normalized = normalized.replaceFirst(RegExp(r'^https?://github\.com/', caseSensitive: false), '');
+            normalized = normalized.replaceFirst(RegExp(r'^git@github\.com:', caseSensitive: false), '');
+            normalized = normalized.split(RegExp(r'[?#]')).first;
+            normalized = normalized.replaceFirst(RegExp(r'\.git/?$', caseSensitive: false), '');
+            normalized = normalized.replaceAll(RegExp(r'\s*/\s*'), '/');
+            normalized = normalized.replaceAll(RegExp(r'^/+|/+$'), '').trim();
+            return normalized;
+          }
 
           bool isValidRepository(String value) => RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(normalizeRepository(value));
+
+          bool _looksLikeNetworkError(Object error) {
+            if (error is SocketException || error is TimeoutException || error is http.ClientException) return true;
+            final message = error.toString().toLowerCase();
+            return message.contains('failed host lookup') ||
+                message.contains('socketexception') ||
+                message.contains('connection reset') ||
+                message.contains('connection timed out') ||
+                message.contains('network is unreachable') ||
+                message.contains('cannot reach github') ||
+                message.contains('dns lookup');
+          }
+
+          String _githubConnectionHint(Object error) =>
+              'Could not reach GitHub (api.github.com) after automatic retries. Check the phone internet connection, VPN, or Private DNS, then retry. If this happened while tracking a build, GitHub Actions may still be running; open the run before starting a duplicate build. Details: $error';
 
           class GitHubApi {
             GitHubApi({
@@ -773,58 +1107,98 @@ jobs:
               Object? body,
             }) async {
               if (accounts.isEmpty) throw Exception('Add a GitHub account in Settings first.');
+              final normalizedMethod = method.toUpperCase();
+              // Clean accidental whitespace introduced by copied repository names or URLs.
+              var cleanPath = path.trim();
+              cleanPath = cleanPath.replaceAll(RegExp(r'\s*/\s*'), '/');
+              cleanPath = cleanPath.replaceAllMapped(RegExp(r'\s*([?&=])\s*'), (match) => match[1]!);
+              final uri = cleanPath.startsWith('https://')
+                  ? Uri.parse(cleanPath)
+                  : Uri.parse('https://api.github.com${cleanPath.startsWith('/') ? cleanPath : '/$cleanPath'}');
+              if (uri.scheme != 'https' || uri.host.toLowerCase() != 'api.github.com') {
+                throw FormatException('Refusing to send GitHub credentials to an unexpected URL host: ${uri.host}.');
+              }
+              if (uri.toString().contains(' ')) {
+                throw FormatException('The GitHub API URL still contains a space: $uri. Check the repository name in Settings.');
+              }
+
               final candidates = autoFailover ? accounts : <GitHubAccount>[accounts.first];
               http.Response? lastResponse;
               Object? lastError;
+              final canSafelyRetry = normalizedMethod == 'GET';
 
               for (var index = 0; index < candidates.length; index++) {
                 final account = candidates[index];
-                try {
-                  final headers = <String, String>{
-                    'Accept': 'application/vnd.github+json',
-                    'Authorization': 'Bearer ${account.token}',
-                    'X-GitHub-Api-Version': '2022-11-28',
-                    'User-Agent': 'Simple-App-Builder',
-                  };
-                  if (body != null) headers['Content-Type'] = 'application/json; charset=utf-8';
-                  final uri = path.startsWith('https://')
-                      ? Uri.parse(path)
-                      : Uri.parse('https://api.github.com$path');
-                  late final http.Response response;
-                  switch (method.toUpperCase()) {
-                    case 'GET':
-                      response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 45));
+                var tryNextAccount = false;
+                final attempts = canSafelyRetry ? 4 : 1;
+                for (var attempt = 0; attempt < attempts; attempt++) {
+                  try {
+                    final headers = <String, String>{
+                      'Accept': 'application/vnd.github+json',
+                      'Authorization': 'Bearer ${account.token}',
+                      'X-GitHub-Api-Version': '2022-11-28',
+                      'User-Agent': 'Simple-App-Builder',
+                    };
+                    if (body != null) headers['Content-Type'] = 'application/json; charset=utf-8';
+                    late final http.Response response;
+                    switch (normalizedMethod) {
+                      case 'GET':
+                        response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 45));
+                        break;
+                      case 'POST':
+                        response = await http.post(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                        break;
+                      case 'PUT':
+                        response = await http.put(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                        break;
+                      case 'DELETE':
+                        response = await http.delete(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                        break;
+                      default:
+                        throw UnsupportedError('Unsupported HTTP method: $method');
+                    }
+                    lastResponse = response;
+                    final remaining = response.headers['x-ratelimit-remaining'];
+                    final authOrRateLimit = response.statusCode == 401 ||
+                        response.statusCode == 403 ||
+                        response.statusCode == 429 ||
+                        remaining == '0';
+                    if (authOrRateLimit && autoFailover && index < candidates.length - 1) {
+                      tryNextAccount = true;
                       break;
-                    case 'POST':
-                      response = await http.post(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                    }
+                    final transientStatus = response.statusCode == 429 || response.statusCode == 500 ||
+                        response.statusCode == 502 || response.statusCode == 503 || response.statusCode == 504;
+                    if (canSafelyRetry && transientStatus && attempt < attempts - 1) {
+                      final retryAfter = int.tryParse(response.headers['retry-after'] ?? '');
+                      final delaySeconds = retryAfter != null && retryAfter > 0
+                          ? retryAfter.clamp(1, 12).toInt()
+                          : (1 << attempt).clamp(1, 8).toInt();
+                      await Future<void>.delayed(Duration(seconds: delaySeconds));
+                      continue;
+                    }
+                    if (response.statusCode < 400 && index > 0) onPromote?.call(account);
+                    return response;
+                  } catch (error) {
+                    lastError = error;
+                    if (_looksLikeNetworkError(error) && canSafelyRetry && attempt < attempts - 1) {
+                      await Future<void>.delayed(Duration(seconds: (1 << attempt).clamp(1, 8).toInt()));
+                      continue;
+                    }
+                    if (_looksLikeNetworkError(error)) throw Exception(_githubConnectionHint(error));
+                    if (autoFailover && index < candidates.length - 1) {
+                      tryNextAccount = true;
                       break;
-                    case 'PUT':
-                      response = await http.put(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
-                      break;
-                    case 'DELETE':
-                      response = await http.delete(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
-                      break;
-                    default:
-                      throw UnsupportedError('Unsupported HTTP method: $method');
+                    }
+                    rethrow;
                   }
-                  lastResponse = response;
-                  final remaining = response.headers['x-ratelimit-remaining'];
-                  final retryable = response.statusCode == 401 ||
-                      response.statusCode == 403 ||
-                      response.statusCode == 429 ||
-                      remaining == '0';
-                  if (retryable && autoFailover && index < candidates.length - 1) {
-                    continue;
-                  }
-                  if (response.statusCode < 400 && index > 0) onPromote?.call(account);
-                  return response;
-                } catch (error) {
-                  lastError = error;
-                  if (!autoFailover || index == candidates.length - 1) break;
                 }
+                if (tryNextAccount) continue;
+                break;
               }
               if (lastResponse != null) return lastResponse;
-              throw Exception('GitHub API request failed: ${lastError ?? 'unknown network error'}');
+              if (lastError != null && _looksLikeNetworkError(lastError)) throw Exception(_githubConnectionHint(lastError));
+              throw Exception('GitHub API request failed: ${lastError ?? 'no response from GitHub'}');
             }
 
             Map<String, dynamic> checkedJson(http.Response response) {
@@ -856,6 +1230,154 @@ jobs:
               final secrets = (json['secrets'] as List<dynamic>? ?? const <dynamic>[])
                   .whereType<Map<String, dynamic>>();
               return secrets.map((item) => (item['name'] ?? '').toString()).where((name) => name.isNotEmpty).toSet();
+            }
+
+            Future<String?> findBackupRepository(String username) async {
+              String? publicMatch;
+              for (var page = 1; page <= 100; page++) {
+                final response = await request('GET', '/user/repos?per_page=100&sort=updated&affiliation=owner&page=$page');
+                if (response.statusCode < 200 || response.statusCode >= 300) checkedJson(response);
+                dynamic parsed;
+                try { parsed = jsonDecode(response.body); } catch (_) { throw Exception('GitHub returned invalid JSON while searching for the backup repository.'); }
+                if (parsed is! List) throw Exception('GitHub returned an unexpected repository list while looking for backups.');
+                for (final item in parsed.whereType<Map<String, dynamic>>()) {
+                  final name = (item['name'] ?? '').toString();
+                  final owner = ((item['owner'] as Map?)?['login'] ?? '').toString();
+                  if (owner.toLowerCase() == username.toLowerCase() &&
+                      name.toLowerCase().startsWith(_backupRepositoryPrefix.toLowerCase())) {
+                    final fullName = (item['full_name'] ?? '').toString();
+                    if (fullName.isEmpty) continue;
+                    if (item['private'] == true) return normalizeRepository(fullName);
+                    publicMatch ??= fullName;
+                  }
+                }
+                if (parsed.length < 100 || !(response.headers['link'] ?? '').contains('rel="next"')) break;
+              }
+              if (publicMatch != null) {
+                throw Exception('Found $publicMatch, but it is public. For safety, Simple App Builder will not upload source code or backups to a public repository. Make that repository private, or rename it if it is not your backup library.');
+              }
+              return null;
+            }
+
+            Future<String> findOrCreateBackupRepository(String username) async {
+              // Deterministic per GitHub username: two devices connecting simultaneously will
+              // race to create the same long backup_456... name, not create separate libraries.
+              final suffix = crypto.sha256
+                  .convert(utf8.encode('simple-app-builder-backup:${username.trim().toLowerCase()}'))
+                  .toString()
+                  .substring(0, 28);
+              final candidate = 'backup_456$suffix';
+              for (var attempt = 0; attempt < 4; attempt++) {
+                final existing = await findBackupRepository(username);
+                if (existing != null) return existing;
+                final response = await request('POST', '/user/repos', body: {
+                  'name': candidate,
+                  'description': 'Private automatic backup library for Simple App Builder projects. Managed automatically by Simple App Builder.',
+                  'private': true,
+                  'auto_init': true,
+                  'has_issues': false,
+                  'has_wiki': false,
+                  'has_projects': false,
+                });
+                if (response.statusCode == 201 || response.statusCode == 200) {
+                  final data = checkedJson(response);
+                  final fullName = (data['full_name'] ?? '').toString();
+                  if (fullName.isEmpty) throw Exception('GitHub created the backup repository but did not return its full name.');
+                  return normalizeRepository(fullName);
+                }
+                if (response.statusCode == 422) {
+                  await Future<void>.delayed(Duration(seconds: 1 + attempt));
+                  final raced = await findBackupRepository(username);
+                  if (raced != null) return raced;
+                  continue;
+                }
+                checkedJson(response);
+              }
+              throw Exception('Could not create the private backup repository after four attempts. Check repository-creation permissions and try again.');
+            }
+
+            String _contentsPath(String filePath) => '$_repoPath/contents/${filePath.split('/').map(Uri.encodeComponent).join('/')}';
+
+            Future<List<String>> listBackupFiles(String branch) async {
+              final response = await request('GET', '$_repoPath/contents/$_backupFolder?ref=${Uri.encodeQueryComponent(branch)}');
+              if (response.statusCode == 404) return <String>[];
+              if (response.statusCode < 200 || response.statusCode >= 300) checkedJson(response);
+              dynamic parsed;
+              try { parsed = jsonDecode(response.body); } catch (_) { throw Exception('Backup repository returned invalid directory data.'); }
+              if (parsed is! List) return <String>[];
+              return parsed.whereType<Map<String, dynamic>>()
+                  .where((item) => (item['type'] ?? '').toString() == 'file' && (item['name'] ?? '').toString().endsWith('.zip'))
+                  .map((item) => (item['path'] ?? '').toString())
+                  .where((path) => path.startsWith('$_backupFolder/') && !path.contains('..'))
+                  .toList();
+            }
+
+            Future<Uint8List?> readBinaryFile(String branch, String path) async {
+              final response = await request('GET', '${_contentsPath(path)}?ref=${Uri.encodeQueryComponent(branch)}');
+              if (response.statusCode == 404) return null;
+              final json = checkedJson(response);
+              final content = (json['content'] ?? '').toString().replaceAll(RegExp(r'\s'), '');
+              if (content.isNotEmpty && (json['encoding'] ?? 'base64').toString() == 'base64') {
+                return Uint8List.fromList(base64Decode(content));
+              }
+              final sha = (json['sha'] ?? '').toString();
+              if (sha.isEmpty) throw Exception('GitHub did not return contents or a blob SHA for $path.');
+              final blob = checkedJson(await request('GET', '$_repoPath/git/blobs/${Uri.encodeComponent(sha)}'));
+              final blobContent = (blob['content'] ?? '').toString().replaceAll(RegExp(r'\s'), '');
+              if (blobContent.isEmpty) throw Exception('GitHub returned an empty blob for backup file $path.');
+              return Uint8List.fromList(base64Decode(blobContent));
+            }
+
+            Future<void> writeBinaryFile(String branch, String path, Uint8List bytes, {required String message}) async {
+              if (bytes.length > 30 * 1024 * 1024) throw Exception('Backup file $path is larger than 30 MB. Reduce the project size before syncing it.');
+              final endpoint = _contentsPath(path);
+              String? sha;
+              final current = await request('GET', '$endpoint?ref=${Uri.encodeQueryComponent(branch)}');
+              if (current.statusCode == 200) {
+                final metadata = jsonDecode(current.body) as Map<String, dynamic>;
+                sha = metadata['sha']?.toString();
+                // Git blob SHA-1 is deterministic. Skip commits for unchanged backup files.
+                final header = utf8.encode('blob ${bytes.length}\u0000');
+                final blobSha = crypto.sha1.convert(<int>[...header, ...bytes]).toString();
+                if (sha == blobSha) return;
+              } else if (current.statusCode != 404) {
+                checkedJson(current);
+              }
+              final body = <String, dynamic>{
+                'message': message,
+                'content': base64Encode(bytes),
+                'branch': branch,
+              };
+              if (sha != null && sha.isNotEmpty) body['sha'] = sha;
+              checkedJson(await request('PUT', endpoint, body: body));
+            }
+
+            Future<List<AppProject>> loadBackupProjects() async {
+              final branch = await defaultBranch();
+              final paths = await listBackupFiles(branch);
+              final projects = <AppProject>[];
+              for (final path in paths) {
+                try {
+                  final bytes = await readBinaryFile(branch, path);
+                  if (bytes == null) continue;
+                  final project = _decodeProjectBackup(bytes);
+                  if (project != null) projects.add(project);
+                } catch (_) {
+                  // One damaged/old backup must not prevent recovery of other projects.
+                  continue;
+                }
+              }
+              return projects;
+            }
+
+            Future<void> saveBackupProjects(List<AppProject> projects) async {
+              final branch = await defaultBranch();
+              for (final project in projects) {
+                final bytes = _encodeProjectBackup(project);
+                final name = _backupFileNameForProject(project);
+                await writeBinaryFile(branch, '$_backupFolder/$name', bytes,
+                  message: 'Back up project ${project.name} from Simple App Builder');
+              }
             }
 
             Future<Map<String, dynamic>> createPrivateRepository(String name, {String? description}) async {
@@ -1006,18 +1528,19 @@ jobs:
             }) async {
               // repository_dispatch keeps project fields out of GitHub's static
               // "Run workflow" form. The mobile app sends a different payload per build.
+              // Keep client_payload at nine scalar properties. GitHub limits this
+              // object to ten properties; nested icon/options objects count toward the limit.
               final response = await request('POST', '$_repoPath/dispatches', body: {
                 'event_type': 'build_flutter_app',
                 'client_payload': {
                   'project_name': projectName,
                   'package_name': packageName,
                   'dependencies': dependencies,
-                  'icon': {'custom': hasCustomIcon, 'path': iconPath},
-                  'options': {
-                    'dynamic_themed_icon': dynamicThemedIcon,
-                    'build_format': buildFormat,
-                    'sign_release': signRelease,
-                  },
+                  'has_custom_icon': hasCustomIcon,
+                  'icon_path': iconPath,
+                  'dynamic_themed_icon': dynamicThemedIcon,
+                  'build_format': buildFormat,
+                  'sign_release': signRelease,
                   'request_id': requestId,
                 },
               });
@@ -1040,7 +1563,6 @@ jobs:
               if (value.contains('build requested output')) return 150;
               if (value.contains('upload generated release apk')) return 10;
               if (value.contains('upload generated android app bundle')) return 10;
-              if (value.contains('upload generated flutter web preview')) return 10;
               if (value.contains('generate the real simple app builder')) return 120;
               if (value.contains('upload simple app builder')) return 8;
               return 25;
@@ -1112,12 +1634,29 @@ jobs:
               void Function(Map<String, dynamic> run, int percent, Duration? remaining, String step) onProgress,
             ) async {
               final pollingStarted = DateTime.now();
+              var consecutiveNetworkFailures = 0;
+              var latestProgress = 3;
               for (var attempt = 0; attempt < 660; attempt++) {
+                if (DateTime.now().difference(pollingStarted) >= const Duration(minutes: 55)) {
+                  throw TimeoutException('Build status polling reached 55 minutes. The remote GitHub run may still be active; open the Actions run before triggering another build.');
+                }
                 await Future<void>.delayed(const Duration(seconds: 5));
-                final runsResponse = await request(
-                  'GET',
-                  '$_repoPath/actions/runs?event=repository_dispatch&per_page=50',
-                );
+                late final http.Response runsResponse;
+                try {
+                  runsResponse = await request(
+                    'GET',
+                    '$_repoPath/actions/runs?event=repository_dispatch&per_page=50',
+                  );
+                  consecutiveNetworkFailures = 0;
+                } catch (error) {
+                  if (!_looksLikeNetworkError(error)) rethrow;
+                  consecutiveNetworkFailures++;
+                  final runUrl = 'https://github.com/${normalizeRepository(repository)}/actions';
+                  onStatus('Temporary internet/DNS problem while checking GitHub (retry $consecutiveNetworkFailures). The build may still be running; reconnecting automatically.');
+                  latestProgress = latestProgress < 5 ? 5 : latestProgress;
+                  onProgress({'id': '', 'html_url': runUrl, 'run_number': 0}, latestProgress, null, 'Reconnecting to GitHub; remote build status is not lost');
+                  continue;
+                }
                 if (runsResponse.statusCode == 404) {
                   onStatus('GitHub accepted the request; waiting for the new repository Actions workflow to appear…');
                   final elapsed = DateTime.now().difference(pollingStarted).inSeconds;
@@ -1151,9 +1690,11 @@ jobs:
                   final Duration? remaining = queuedElapsed >= 240
                     ? null
                     : Duration(seconds: (240 - queuedElapsed) < 25 ? 25 : 240 - queuedElapsed);
-                  onProgress(run, status == 'queued' ? 3 : 8, remaining, status == 'queued' ? 'Waiting for a GitHub runner' : 'Starting build steps and estimating duration');
+                  latestProgress = status == 'queued' ? 3 : 8;
+                  onProgress(run, latestProgress, remaining, status == 'queued' ? 'Waiting for a GitHub runner' : 'Starting build steps and estimating duration');
                 } else {
-                  onProgress(run, (snapshot['percent'] as int?) ?? 8, Duration(seconds: (snapshot['remainingSeconds'] as int?) ?? 120), (snapshot['step'] ?? 'Building').toString());
+                  latestProgress = (snapshot['percent'] as int?) ?? 8;
+                  onProgress(run, latestProgress, Duration(seconds: (snapshot['remainingSeconds'] as int?) ?? 120), (snapshot['step'] ?? 'Building').toString());
                 }
                 if (status == 'completed') {
                   if (run['conclusion'] != 'success') {
@@ -1173,52 +1714,68 @@ jobs:
               Object? lastError;
               for (var index = 0; index < candidates.length; index++) {
                 final account = candidates[index];
-                final client = http.Client();
-                try {
-                  final uri = endpoint.startsWith('https://') ? Uri.parse(endpoint) : Uri.parse('https://api.github.com$endpoint');
-                  final apiRequest = http.Request('GET', uri)
-                    ..followRedirects = false
-                    ..headers.addAll({
-                      'Accept': 'application/vnd.github+json',
-                      'Authorization': 'Bearer ${account.token}',
-                      'X-GitHub-Api-Version': '2022-11-28',
-                      'User-Agent': 'Simple-App-Builder',
-                    });
-                  final streamed = await client.send(apiRequest).timeout(const Duration(minutes: 3));
-                  final initial = await http.Response.fromStream(streamed).timeout(const Duration(minutes: 3));
-                  Uint8List bytes;
-                  if (initial.statusCode == 302 || initial.statusCode == 303 || initial.statusCode == 307 || initial.statusCode == 308) {
-                    final location = initial.headers['location'];
-                    if (location == null || location.isEmpty) throw Exception('GitHub returned HTTP ${initial.statusCode} without a download Location header.');
-                    // GitHub's signed artifact URL is on a separate storage host. Do not forward the PAT to it.
-                    final downloadRequest = http.Request('GET', uri.resolve(location))..followRedirects = true;
-                    final downloadStream = await client.send(downloadRequest).timeout(const Duration(minutes: 3));
-                    final downloadResponse = await http.Response.fromStream(downloadStream).timeout(const Duration(minutes: 3));
-                    if (downloadResponse.statusCode != 200) {
-                      final excerpt = utf8.decode(downloadResponse.bodyBytes.take(300).toList(), allowMalformed: true);
-                      throw Exception('Signed artifact URL returned HTTP ${downloadResponse.statusCode}: ${excerpt.trim()}');
+                for (var attempt = 0; attempt < 4; attempt++) {
+                  final client = http.Client();
+                  try {
+                    final cleanEndpoint = endpoint.trim().replaceAll(RegExp(r'\s*/\s*'), '/').replaceAllMapped(RegExp(r'\s*([?&=])\s*'), (match) => match[1]!);
+                    final uri = cleanEndpoint.startsWith('https://') ? Uri.parse(cleanEndpoint) : Uri.parse('https://api.github.com${cleanEndpoint.startsWith('/') ? cleanEndpoint : '/$cleanEndpoint'}');
+                    if (uri.scheme != 'https' || uri.host.toLowerCase() != 'api.github.com') {
+                      throw FormatException('Unexpected GitHub artifact URL: $uri');
                     }
-                    bytes = Uint8List.fromList(downloadResponse.bodyBytes);
-                  } else if (initial.statusCode == 200) {
-                    bytes = Uint8List.fromList(initial.bodyBytes);
-                  } else {
-                    final retryable = initial.statusCode == 401 || initial.statusCode == 403 || initial.statusCode == 429;
-                    final excerpt = initial.body.length > 300 ? initial.body.substring(0, 300) : initial.body;
-                    final error = Exception('GitHub artifact download endpoint returned HTTP ${initial.statusCode}: ${excerpt.trim()}');
-                    if (retryable && autoFailover && index < candidates.length - 1) { lastError = error; continue; }
-                    throw error;
+                    final apiRequest = http.Request('GET', uri)
+                      ..followRedirects = false
+                      ..headers.addAll({
+                        'Accept': 'application/vnd.github+json',
+                        'Authorization': 'Bearer ${account.token}',
+                        'X-GitHub-Api-Version': '2022-11-28',
+                        'User-Agent': 'Simple-App-Builder',
+                      });
+                    final streamed = await client.send(apiRequest).timeout(const Duration(minutes: 3));
+                    final initial = await http.Response.fromStream(streamed).timeout(const Duration(minutes: 3));
+                    Uint8List bytes;
+                    if (initial.statusCode == 302 || initial.statusCode == 303 || initial.statusCode == 307 || initial.statusCode == 308) {
+                      final location = initial.headers['location'];
+                      if (location == null || location.isEmpty) throw Exception('GitHub returned HTTP ${initial.statusCode} without a download Location header.');
+                      // GitHub's signed artifact URL is on a separate storage host. Never forward the PAT there.
+                      final downloadRequest = http.Request('GET', uri.resolve(location))..followRedirects = true;
+                      final downloadStream = await client.send(downloadRequest).timeout(const Duration(minutes: 3));
+                      final downloadResponse = await http.Response.fromStream(downloadStream).timeout(const Duration(minutes: 3));
+                      if (downloadResponse.statusCode != 200) {
+                        final excerpt = utf8.decode(downloadResponse.bodyBytes.take(300).toList(), allowMalformed: true);
+                        throw Exception('Signed artifact URL returned HTTP ${downloadResponse.statusCode}: ${excerpt.trim()}');
+                      }
+                      bytes = Uint8List.fromList(downloadResponse.bodyBytes);
+                    } else if (initial.statusCode == 200) {
+                      bytes = Uint8List.fromList(initial.bodyBytes);
+                    } else {
+                      final retryable = initial.statusCode == 401 || initial.statusCode == 403 || initial.statusCode == 429;
+                      final excerpt = initial.body.length > 300 ? initial.body.substring(0, 300) : initial.body;
+                      final error = Exception('GitHub artifact download endpoint returned HTTP ${initial.statusCode}: ${excerpt.trim()}');
+                      if (retryable && autoFailover && index < candidates.length - 1) { lastError = error; break; }
+                      if ((initial.statusCode == 429 || initial.statusCode == 500 || initial.statusCode == 502 || initial.statusCode == 503 || initial.statusCode == 504) && attempt < 3) {
+                        await Future<void>.delayed(Duration(seconds: (1 << attempt).clamp(1, 8).toInt()));
+                        continue;
+                      }
+                      throw error;
+                    }
+                    if (bytes.length < 4 || bytes[0] != 0x50 || bytes[1] != 0x4b) {
+                      final excerpt = utf8.decode(bytes.take(200).toList(), allowMalformed: true);
+                      throw Exception('GitHub download returned ${bytes.length} bytes, but it is not a ZIP archive. ${excerpt.trim()}');
+                    }
+                    if (index > 0) onPromote?.call(account);
+                    return bytes;
+                  } catch (error) {
+                    lastError = error;
+                    if (_looksLikeNetworkError(error) && attempt < 3) {
+                      await Future<void>.delayed(Duration(seconds: (1 << attempt).clamp(1, 8).toInt()));
+                      continue;
+                    }
+                    if (_looksLikeNetworkError(error)) throw Exception(_githubConnectionHint(error));
+                    if (autoFailover && index < candidates.length - 1) break;
+                    throw Exception('Could not download GitHub ZIP data: $error');
+                  } finally {
+                    client.close();
                   }
-                  if (bytes.length < 4 || bytes[0] != 0x50 || bytes[1] != 0x4b) {
-                    final excerpt = utf8.decode(bytes.take(200).toList(), allowMalformed: true);
-                    throw Exception('GitHub download returned ${bytes.length} bytes, but it is not a ZIP archive. ${excerpt.trim()}');
-                  }
-                  if (index > 0) onPromote?.call(account);
-                  return bytes;
-                } catch (error) {
-                  lastError = error;
-                  if (!autoFailover || index == candidates.length - 1) break;
-                } finally {
-                  client.close();
                 }
               }
               throw Exception('Could not download GitHub ZIP data: ${lastError ?? 'unknown download error'}');
@@ -1227,12 +1784,10 @@ jobs:
             Future<Uint8List> downloadGeneratedArtifact(String runId, String format) async {
               final prefix = switch (format) {
                 'aab' => 'generated-aab-',
-                'web_preview' => 'generated-web-',
                 _ => 'generated-apk-',
               };
               final label = switch (format) {
                 'aab' => 'Android App Bundle',
-                'web_preview' => 'Flutter Web preview',
                 _ => 'APK',
               };
               final json = checkedJson(await request('GET', '$_repoPath/actions/runs/$runId/artifacts?per_page=100'));
@@ -1304,17 +1859,46 @@ jobs:
             State<SimpleAppBuilder> createState() => _SimpleAppBuilderState();
           }
 
-          class _SimpleAppBuilderState extends State<SimpleAppBuilder> {
+          class _SimpleAppBuilderState extends State<SimpleAppBuilder> with WidgetsBindingObserver {
             bool _ready = false;
             List<GitHubAccount> _accounts = [];
             List<AppProject> _projects = [];
             bool _autoFailover = true;
             String _repository = compiledRepository;
+            Map<String, String> _backupRepositories = <String, String>{};
+            Timer? _backupTimer;
+            Timer? _backupDebounce;
+            Timer? _backupRetryTimer;
+            int _backupRetryAttempt = 0;
+            bool _backupSyncInProgress = false;
+            bool _backupSyncRequestedAgain = false;
+            bool _backupRestoreRequestedAgain = false;
+            String _backupStatus = 'Preparing automatic project backup…';
 
             @override
             void initState() {
               super.initState();
+              WidgetsBinding.instance.addObserver(this);
               _loadState();
+              _backupTimer = Timer.periodic(const Duration(minutes: 15), (_) {
+                unawaited(_synchronizeBackups(restoreCloud: false));
+              });
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState state) {
+              if (state == AppLifecycleState.resumed) {
+                unawaited(_synchronizeBackups(restoreCloud: false));
+              }
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              _backupTimer?.cancel();
+              _backupDebounce?.cancel();
+              _backupRetryTimer?.cancel();
+              super.dispose();
             }
 
             Future<void> _loadState() async {
@@ -1342,9 +1926,17 @@ jobs:
               } catch (_) {
                 _projects = [];
               }
+              try {
+                final rawBackups = prefs.getString('backup_repositories_v1');
+                if (rawBackups != null) {
+                  final decoded = jsonDecode(rawBackups);
+                  if (decoded is Map) _backupRepositories = decoded.map<String, String>((key, value) => MapEntry<String, String>(key.toString().toLowerCase(), normalizeRepository(value.toString())));
+                }
+              } catch (_) { _backupRepositories = <String, String>{}; }
               _autoFailover = prefs.getBool('auto_failover') ?? true;
               _repository = normalizeRepository(prefs.getString('repository') ?? compiledRepository);
               if (mounted) setState(() => _ready = true);
+              if (_accounts.isNotEmpty) unawaited(_synchronizeBackups(restoreCloud: true));
             }
 
             Future<void> _saveAccounts(List<GitHubAccount> accounts) async {
@@ -1354,13 +1946,173 @@ jobs:
                 value: jsonEncode(_accounts.map((a) => a.toJson()).toList()),
               );
               if (mounted) setState(() {});
+              if (_accounts.isNotEmpty) {
+                unawaited(_synchronizeBackups(restoreCloud: true));
+              } else {
+                _resetBackupRetry();
+              }
             }
 
-            Future<void> _saveProjects(List<AppProject> projects) async {
+            Future<void> _storeProjectsLocally(List<AppProject> projects) async {
               _projects = List<AppProject>.from(projects);
               final prefs = await SharedPreferences.getInstance();
               await prefs.setString('projects_v1', jsonEncode(_projects.map((p) => p.toJson()).toList()));
               if (mounted) setState(() {});
+            }
+
+            Future<void> _saveProjects(List<AppProject> projects) async {
+              final previous = <String, AppProject>{for (final project in _projects) project.id: project};
+              final now = DateTime.now().millisecondsSinceEpoch;
+              final normalized = <AppProject>[];
+              for (final project in projects) {
+                final old = previous[project.id];
+                var timestamp = project.updatedAtMillis;
+                if (old == null) {
+                  if (timestamp <= 0) timestamp = now;
+                } else if (jsonEncode(_projectComparable(old)) != jsonEncode(_projectComparable(project))) {
+                  timestamp = now;
+                } else if (timestamp <= 0) {
+                  timestamp = old.updatedAtMillis;
+                }
+                normalized.add(project.copyWith(updatedAtMillis: timestamp));
+              }
+              await _storeProjectsLocally(normalized);
+              _scheduleBackupSync();
+            }
+
+            void _scheduleBackupSync() {
+              _backupDebounce?.cancel();
+              _backupDebounce = Timer(const Duration(seconds: 18), () {
+                unawaited(_synchronizeBackups(restoreCloud: false));
+              });
+            }
+
+            Future<void> _persistBackupRepositoryMap() async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('backup_repositories_v1', jsonEncode(_backupRepositories));
+            }
+
+            void _scheduleBackupRetry({required String reason}) {
+              _backupRetryTimer?.cancel();
+              _backupRetryAttempt = (_backupRetryAttempt + 1).clamp(1, 5).toInt();
+              const retryMinutes = <int>[1, 2, 4, 8, 15];
+              final minutes = retryMinutes[_backupRetryAttempt - 1];
+              if (mounted) setState(() => _backupStatus = '$reason. Retrying automatically in about $minutes minute(s).');
+              _backupRetryTimer = Timer(Duration(minutes: minutes), () {
+                unawaited(_synchronizeBackups(restoreCloud: true));
+              });
+            }
+
+            void _resetBackupRetry() {
+              _backupRetryAttempt = 0;
+              _backupRetryTimer?.cancel();
+              _backupRetryTimer = null;
+            }
+
+            Future<void> _synchronizeBackups({required bool restoreCloud}) async {
+              if (_accounts.isEmpty) return;
+              if (_backupSyncInProgress) {
+                _backupSyncRequestedAgain = true;
+                _backupRestoreRequestedAgain = _backupRestoreRequestedAgain || restoreCloud;
+                return;
+              }
+              _backupSyncInProgress = true;
+              try {
+                if (mounted) setState(() => _backupStatus = 'Checking private backup repositories…');
+                final accountRepositories = <({GitHubAccount account, String repository, GitHubApi api})>[];
+                final restoredProjects = <AppProject>[];
+                final backupErrors = <String>[];
+                for (final account in List<GitHubAccount>.from(_accounts)) {
+                  final key = account.username.toLowerCase();
+                  final accountApi = GitHubApi(repository: 'placeholder/placeholder', accounts: [account], autoFailover: false);
+                  var backupRepository = _backupRepositories[key] ?? '';
+                  var repositoryUsable = false;
+                  if (backupRepository.isNotEmpty && isValidRepository(backupRepository)) {
+                    final owner = normalizeRepository(backupRepository).split('/').first;
+                    final repo = normalizeRepository(backupRepository).split('/').last;
+                    final check = await accountApi.request('GET', '/repos/${Uri.encodeComponent(owner)}/${Uri.encodeComponent(repo)}');
+                    if (check.statusCode == 404) {
+                      repositoryUsable = false;
+                    } else {
+                      final backupInfo = accountApi.checkedJson(check);
+                      final actualFullName = normalizeRepository((backupInfo['full_name'] ?? backupRepository).toString());
+                      final actualParts = actualFullName.split('/');
+                      if (backupInfo['private'] != true) {
+                        throw Exception('The saved backup repository $actualFullName is not private. For safety, it will not be used to store source code; change its visibility to private in GitHub first.');
+                      }
+                      if (actualParts.length != 2 || actualParts.first.toLowerCase() != account.username.toLowerCase() || !actualParts.last.toLowerCase().startsWith(_backupRepositoryPrefix.toLowerCase())) {
+                        throw Exception('Saved backup repository mapping $actualFullName is invalid for ${account.username}. Refusing to upload source code there.');
+                      }
+                      repositoryUsable = true;
+                    }
+                  }
+                  if (!repositoryUsable) {
+                    backupRepository = await accountApi.findOrCreateBackupRepository(account.username);
+                    _backupRepositories[key] = backupRepository;
+                    await _persistBackupRepositoryMap();
+                  }
+                  final backupApi = accountApi.forRepository(backupRepository);
+                  accountRepositories.add((account: account, repository: backupRepository, api: backupApi));
+                  if (restoreCloud) {
+                    try {
+                      restoredProjects.addAll(await backupApi.loadBackupProjects());
+                    } catch (error) {
+                      backupErrors.add('Restore from $backupRepository: $error');
+                    }
+                  }
+                }
+
+                if (restoreCloud && restoredProjects.isNotEmpty) {
+                  final merged = <String, AppProject>{for (final project in _projects) project.id: project};
+                  for (final remote in restoredProjects) {
+                    final local = merged[remote.id];
+                    if (local == null || remote.updatedAtMillis > local.updatedAtMillis) merged[remote.id] = remote;
+                  }
+                  await _storeProjectsLocally(merged.values.toList()..sort((a, b) => b.updatedAtMillis.compareTo(a.updatedAtMillis)));
+                }
+
+                final snapshot = List<AppProject>.from(_projects);
+                if (snapshot.isNotEmpty) {
+                  for (final item in accountRepositories) {
+                    try {
+                      await item.api.saveBackupProjects(snapshot);
+                    } catch (error) {
+                      backupErrors.add('Sync to ${item.repository}: $error');
+                    }
+                  }
+                }
+                final hasNetworkBackupError = backupErrors.any((message) => _looksLikeNetworkError(Exception(message)));
+                if (hasNetworkBackupError) {
+                  _scheduleBackupRetry(reason: 'A temporary network/DNS issue interrupted part of backup synchronization');
+                } else {
+                  _resetBackupRetry();
+                  if (mounted) setState(() {
+                    final names = accountRepositories.map((item) => item.repository).toSet().join(', ');
+                    if (accountRepositories.isEmpty) {
+                      _backupStatus = 'No backup account is connected.';
+                    } else if (backupErrors.isNotEmpty) {
+                      final excerpt = backupErrors.take(3).join(' | ');
+                      _backupStatus = 'Backups configured · ${accountRepositories.length} account(s) · $names. Some items need attention: $excerpt';
+                    } else {
+                      _backupStatus = 'Automatic backup active · ${accountRepositories.length} account(s) · $names · syncs on changes and every 15 minutes.';
+                    }
+                  });
+                }
+              } catch (error) {
+                if (_looksLikeNetworkError(error)) {
+                  _scheduleBackupRetry(reason: 'Automatic backup could not reach GitHub');
+                } else if (mounted) {
+                  setState(() => _backupStatus = 'Automatic backup needs attention: $error');
+                }
+              } finally {
+                _backupSyncInProgress = false;
+                if (_backupSyncRequestedAgain) {
+                  final restoreAgain = _backupRestoreRequestedAgain;
+                  _backupSyncRequestedAgain = false;
+                  _backupRestoreRequestedAgain = false;
+                  unawaited(Future<void>.delayed(const Duration(seconds: 2), () => _synchronizeBackups(restoreCloud: restoreAgain)));
+                }
+              }
             }
 
             Future<void> _saveFailover(bool enabled) async {
@@ -1432,6 +2184,7 @@ jobs:
                                   projects: _projects,
                                   autoFailover: _autoFailover,
                                   repository: _repository,
+                                  backupStatus: _backupStatus,
                                   apiFactory: _api,
                                   onAccountsChanged: _saveAccounts,
                                   onProjectsChanged: _saveProjects,
@@ -1515,7 +2268,7 @@ jobs:
                           const SizedBox(height: 24),
                           Text('Create a classic GitHub token', style: Theme.of(context).textTheme.titleLarge),
                           const SizedBox(height: 8),
-                          const SelectableText('1. Sign in to GitHub and open Settings.\n2. Go to Developer settings → Personal access tokens → Tokens (classic).\n3. Select Generate new token (classic), give it a clear name and expiry.\n4. Explicitly check BOTH scopes: repo and workflow. repo allows the app to create a private repository and upload project files; workflow allows it to install/update the build workflow.\n5. Generate the token and copy it immediately. GitHub only shows the full value once.\n6. Return here and paste the token. Never commit it to a repository or share it in Dart code. Organization policies may restrict repository creation.'),
+                          const SelectableText('1. Sign in to GitHub and open Settings.\n2. Go to Developer settings → Personal access tokens → Tokens (classic).\n3. Select Generate new token (classic), give it a clear name and expiry.\n4. Explicitly check BOTH scopes: repo and workflow. repo allows the app to create a private repository and upload project files; workflow allows it to install/update the build workflow.\n5. Generate the token and copy it immediately. GitHub only shows the full value once.\n6. Return here and paste the token. On first connection, Simple App Builder searches your account for a private repository whose name starts with backup_456; it reuses that repository if found, otherwise it creates one. Never commit the token to a repository or share it in Dart code. Organization policies may restrict repository creation.'),
                           const SizedBox(height: 10),
                           OutlinedButton.icon(onPressed: () => launchUrl(Uri.parse('https://github.com/settings/tokens/new?scopes=repo,workflow&description=Simple%20App%20Builder'), mode: LaunchMode.externalApplication), icon: const Icon(Icons.open_in_new), label: const Text('Open classic token creation page')),
                           const SizedBox(height: 8),
@@ -1534,6 +2287,7 @@ jobs:
               required this.projects,
               required this.autoFailover,
               required this.repository,
+              required this.backupStatus,
               required this.apiFactory,
               required this.onAccountsChanged,
               required this.onProjectsChanged,
@@ -1545,6 +2299,7 @@ jobs:
             final List<AppProject> projects;
             final bool autoFailover;
             final String repository;
+            final String backupStatus;
             final GitHubApi Function() apiFactory;
             final Future<void> Function(List<GitHubAccount>) onAccountsChanged;
             final Future<void> Function(List<AppProject>) onProjectsChanged;
@@ -1556,10 +2311,9 @@ jobs:
           }
 
           class _DashboardScreenState extends State<DashboardScreen> {
-            Future<void> _openWizard({AppProject? project, bool livePreview = false}) async {
+            Future<void> _openWizard({AppProject? project}) async {
               await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => ProjectWizard(
                 existing: project,
-                initialMode: livePreview ? 'web_preview' : null,
                 repository: widget.repository,
                 apiFactory: widget.apiFactory,
                 onSaveProject: (updated) async {
@@ -1625,11 +2379,14 @@ jobs:
                           Text('Build your first app', style: Theme.of(context).textTheme.headlineSmall),
                           const SizedBox(height: 8),
                           const Text('Create a Flutter project, choose an icon, paste or import Dart code, then build and download a release APK through GitHub Actions.', textAlign: TextAlign.center),
+                          const SizedBox(height: 10),
+                          Text(widget.backupStatus, textAlign: TextAlign.center, style: Theme.of(context).textTheme.bodySmall),
                           const SizedBox(height: 18),
                           FilledButton.icon(onPressed: () => _openWizard(), icon: const Icon(Icons.add), label: const Text('Create project')),
                         ])))
                       : ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 92), children: [
                           Card(child: ListTile(leading: const Icon(Icons.cloud_done_outlined), title: Text(widget.repository.isEmpty ? 'Repository not configured' : widget.repository), subtitle: Text('${widget.accounts.length} GitHub account(s) · ${widget.autoFailover ? 'automatic failover on' : 'automatic failover off'}'), trailing: const Icon(Icons.chevron_right), onTap: _settings)),
+                          Card(child: ListTile(leading: const Icon(Icons.backup_outlined), title: const Text('Automatic project backups'), subtitle: Text(widget.backupStatus), isThreeLine: true, onTap: _settings)),
                           const SizedBox(height: 8),
                           ...widget.projects.map((project) => Card(
                             child: ListTile(
@@ -1643,14 +2400,12 @@ jobs:
                                   if (value == 'build') _openWizard(project: project);
                                   if (value == 'name') _rename(project);
                                   if (value == 'code') _editCode(project);
-                                  if (value == 'live') _openWizard(project: project, livePreview: true);
                                   if (value == 'delete') _delete(project);
                                 },
                                 itemBuilder: (_) => const [
                                   PopupMenuItem(value: 'build', child: ListTile(dense: true, leading: Icon(Icons.rocket_launch_outlined), title: Text('Build / manage'))),
                                   PopupMenuItem(value: 'name', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename'))),
                                   PopupMenuItem(value: 'code', child: ListTile(dense: true, leading: Icon(Icons.code), title: Text('Edit Dart source'))),
-                                  PopupMenuItem(value: 'live', child: ListTile(dense: true, leading: Icon(Icons.web), title: Text('Flutter Preview (Web)'))),
                                   PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete'))),
                                 ],
                               ),
@@ -1885,14 +2640,12 @@ jobs:
               required this.apiFactory,
               required this.onSaveProject,
               this.existing,
-              this.initialMode,
-            });
+              });
 
             final String repository;
             final GitHubApi Function() apiFactory;
             final Future<void> Function(AppProject project) onSaveProject;
             final AppProject? existing;
-            final String? initialMode;
 
             @override
             State<ProjectWizard> createState() => _ProjectWizardState();
@@ -1923,6 +2676,7 @@ jobs:
             String? _lastRunUrl;
             bool _githubBuildSucceeded = false;
             DateTime? _buildStartedAt;
+            Timer? _draftSaveTimer;
 
             List<String> get _sortedAdditionalPaths => _additionalFiles.keys.toList()..sort();
             String get _currentFolderPrefix => '$_currentFolder/';
@@ -1966,6 +2720,9 @@ jobs:
               _name = TextEditingController(text: widget.existing?.name ?? 'My Flutter App');
               _packageName = TextEditingController(text: widget.existing?.packageName ?? 'com.example.myapp');
               _dependencies = TextEditingController(text: widget.existing?.dependencies ?? '');
+              _name.addListener(_scheduleDraftSave);
+              _packageName.addListener(_scheduleDraftSave);
+              _dependencies.addListener(_scheduleDraftSave);
               final savedTargetRepository = normalizeRepository(widget.existing?.repository ?? '');
               _targetRepository = savedTargetRepository;
               final savedRepoName = savedTargetRepository.contains('/') ? savedTargetRepository.split('/').last : '';
@@ -1989,12 +2746,6 @@ jobs:
               }
               _buildFormat = widget.existing?.buildFormat == 'aab' ? 'aab' : 'apk';
               _signRelease = widget.existing?.signRelease ?? false;
-              if (widget.initialMode == 'web_preview') {
-                _step = 3;
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) unawaited(_buildAndDownload(requestedFormat: 'web_preview'));
-                });
-              }
               if (widget.existing?.iconBase64 != null) {
                 try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
               }
@@ -2003,10 +2754,28 @@ jobs:
                 _iconPreviewBytes = _iconBytes;
                 WidgetsBinding.instance.addPostFrameCallback((_) { unawaited(_refreshIconPreview()); });
               }
+              WidgetsBinding.instance.addPostFrameCallback((_) { if (mounted) _scheduleDraftSave(); });
+            }
+
+            void _scheduleDraftSave() {
+              _draftSaveTimer?.cancel();
+              _draftSaveTimer = Timer(const Duration(milliseconds: 1400), () async {
+                if (!mounted) return;
+                try {
+                  await widget.onSaveProject(_project());
+                } catch (_) {
+                  // Draft autosave is best-effort; the explicit Build/Save path still reports errors.
+                }
+              });
             }
 
             @override
             void dispose() {
+              _draftSaveTimer?.cancel();
+              _name.removeListener(_scheduleDraftSave);
+              _packageName.removeListener(_scheduleDraftSave);
+              _dependencies.removeListener(_scheduleDraftSave);
+              if (_name.text.trim().isNotEmpty) unawaited(widget.onSaveProject(_project()));
               _name.dispose();
               _packageName.dispose();
               _dependencies.dispose();
@@ -2101,6 +2870,7 @@ jobs:
                 final decoded = img.decodeImage(bytes);
                 if (decoded == null || decoded.width * decoded.height > 40000000) { _message('The image is unsupported or exceeds 40 megapixels.'); return; }
                 setState(() => _iconBytes = bytes);
+                _scheduleDraftSave();
                 await _refreshIconPreview();
               } catch (error) {
                 _message('Could not open this image: $error');
@@ -2117,6 +2887,7 @@ jobs:
                   _dartCode = utf8.decode(bytes, allowMalformed: true);
                   _selectedTemplate = 'Custom project';
                 });
+                _scheduleDraftSave();
                 _message('Imported ${picked.name} as lib/main.dart. Use folder or ZIP import to preserve multiple file paths.');
               } catch (error) {
                 _message('Could not read the Dart file: $error');
@@ -2153,6 +2924,7 @@ jobs:
                   _currentFolder = 'lib';
                   _selectedTemplate = 'Custom project';
                 });
+                _scheduleDraftSave();
                 _message('Imported ${_additionalFiles.length + 1} Dart files. Other Flutter project files/assets are not copied by this Dart-source importer.');
               } catch (error) {
                 _message('Folder import failed: $error');
@@ -2195,6 +2967,7 @@ jobs:
                   _currentFolder = 'lib';
                   _selectedTemplate = 'Custom project';
                 });
+                _scheduleDraftSave();
                 _message('Imported ${_additionalFiles.length + 1} Dart files from ${picked.name}.');
               } catch (error) {
                 _message('ZIP import failed: $error');
@@ -2216,6 +2989,7 @@ jobs:
                 }
                 _selectedTemplate = 'Custom project';
               });
+              _scheduleDraftSave();
             }
 
             Future<void> _addDartFile({String? initialPath}) async {
@@ -2266,6 +3040,7 @@ jobs:
                 _currentFolder = parent;
                 _selectedTemplate = 'Custom project';
               });
+              _scheduleDraftSave();
               await _editFile(path);
             }
 
@@ -2279,7 +3054,7 @@ jobs:
                   FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
                 ],
               ));
-              if (confirmed == true) setState(() => _additionalFiles.remove(path));
+              if (confirmed == true) { setState(() => _additionalFiles.remove(path)); _scheduleDraftSave(); }
             }
 
             Future<void> _createFolder({String? initialPath}) async {
@@ -2311,6 +3086,7 @@ jobs:
                 _folders.add(path);
                 _selectedTemplate = 'Custom project';
               });
+              _scheduleDraftSave();
               _message('Created folder ${path.split('/').last}. Open it to add files or subfolders.');
             }
 
@@ -2350,6 +3126,7 @@ jobs:
                 }
                 _selectedTemplate = 'Custom project';
               });
+              _scheduleDraftSave();
               _message('Folder renamed to ${newPath.split('/').last}. Imports in Dart files may need updating.');
             }
 
@@ -2368,6 +3145,7 @@ jobs:
                   _currentFolder = slash <= 0 ? 'lib' : path.substring(0, slash);
                 }
               });
+              _scheduleDraftSave();
             }
 
             Future<void> _applyTemplate() async {
@@ -2391,6 +3169,7 @@ jobs:
                 _folders = <String>{..._additionalFiles.keys.expand(_folderAncestors)};
                 _currentFolder = 'lib';
               });
+              _scheduleDraftSave();
             }
 
             Uint8List _createSourceArchive() {
@@ -2448,8 +3227,7 @@ jobs:
 
             Future<void> _buildAndDownload({String? requestedFormat}) async {
               final outputFormat = requestedFormat ?? _buildFormat;
-              final isPreview = outputFormat == 'web_preview';
-              if (_signRelease && !isPreview && normalizeRepository(_targetRepository).isEmpty) {
+              if (_signRelease && normalizeRepository(_targetRepository).isEmpty) {
                 _message('Custom signing needs GitHub Actions secrets in the app’s private repository. First build this project with signing turned off so its private repository is created. Then add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD and ANDROID_KEY_ALIAS under Settings → Secrets and variables → Actions, and rebuild with signing enabled.');
                 return;
               }
@@ -2496,7 +3274,7 @@ jobs:
                   _updateProgress(6, const Duration(minutes: 4), 'Reusing this app’s private repository');
                   targetApi = templateApi.forRepository(targetRepository);
                   targetBranch = await targetApi!.defaultBranch();
-                  if (_signRelease && !isPreview) {
+                  if (_signRelease) {
                     const requiredSigningSecrets = <String>{
                       'ANDROID_KEYSTORE_BASE64',
                       'ANDROID_KEYSTORE_PASSWORD',
@@ -2534,7 +3312,7 @@ jobs:
                 }
 
                 await widget.onSaveProject(_project(repository: targetRepository));
-                final hasCustomIcon = _iconBytes != null && !isPreview;
+                final hasCustomIcon = _iconBytes != null;
                 if (!hasCustomIcon) {
                   _updateProgress(8, const Duration(minutes: 4), 'Ensuring this app repository has a default logo');
                   final templateLogo = await templateApi.readRootLogo(templateBranch);
@@ -2557,12 +3335,11 @@ jobs:
                     'project_name': _name.text.trim(),
                     'package_name': _packageName.text.trim(),
                     'dependencies': _dependencies.text.trim(),
-                    'icon': {'custom': hasCustomIcon, 'path': iconPath},
-                    'options': {
-                      'dynamic_themed_icon': _dynamicThemedIcon,
-                      'build_format': outputFormat,
-                      'sign_release': _signRelease && !isPreview,
-                    },
+                    'has_custom_icon': hasCustomIcon,
+                    'icon_path': iconPath,
+                    'dynamic_themed_icon': _dynamicThemedIcon,
+                    'build_format': outputFormat,
+                    'sign_release': _signRelease,
                     'request_id': requestId,
                   },
                 })).length;
@@ -2585,7 +3362,7 @@ jobs:
                   dynamicThemedIcon: _dynamicThemedIcon,
                   requestId: requestId,
                   buildFormat: outputFormat,
-                  signRelease: _signRelease && !isPreview,
+                  signRelease: _signRelease,
                 );
                 final run = await targetApi!.waitForBuild(
                   requestId,
@@ -2604,62 +3381,10 @@ jobs:
                 _lastRunId = (run['id'] ?? '').toString();
                 _lastRunUrl = (run['html_url'] ?? '').toString();
                 _githubBuildSucceeded = true;
-                _updateProgress(97, const Duration(seconds: 8), 'GitHub succeeded; retrieving the ${isPreview ? 'Web preview' : outputFormat.toUpperCase()} artifact');
-                _setStatus('GitHub reports success for $targetRepository. Downloading the ${isPreview ? 'Flutter Web preview' : outputFormat.toUpperCase()} artifact…');
+                _updateProgress(97, const Duration(seconds: 8), 'GitHub succeeded; retrieving the ${outputFormat.toUpperCase()} artifact');
+                _setStatus('GitHub reports success for $targetRepository. Downloading the ${outputFormat.toUpperCase()} artifact…');
                 final zip = await targetApi!.downloadGeneratedArtifact(_lastRunId!, outputFormat);
                 final archive = ZipDecoder().decodeBytes(zip);
-                if (isPreview) {
-                  ArchiveFile? webZip;
-                  for (final file in archive.files) {
-                    if (file.isFile && file.name.toLowerCase().endsWith('.zip')) { webZip = file; break; }
-                  }
-                  if (webZip == null) {
-                    final contents = archive.files.where((item) => item.isFile).map((item) => item.name).join(', ');
-                    throw Exception('GitHub succeeded but the Web artifact ZIP did not contain a nested website ZIP. Entries: ${contents.isEmpty ? '(none)' : contents}.');
-                  }
-                  final webArchive = ZipDecoder().decodeBytes(Uint8List.fromList(webZip.content as List<int>));
-                  final docs = await getApplicationDocumentsDirectory();
-                  final previewDir = Directory('${docs.path}${Platform.pathSeparator}live_previews${Platform.pathSeparator}$_projectId-${DateTime.now().millisecondsSinceEpoch}');
-                  await previewDir.create(recursive: true);
-                  var totalBytes = 0;
-                  var fileCount = 0;
-                  var hasIndex = false;
-                  for (final entry in webArchive.files) {
-                    if (!entry.isFile) continue;
-                    final normalized = entry.name.replaceAll('\\', '/');
-                    final segments = normalized.split('/');
-                    if (normalized.startsWith('/') || segments.any((part) => part.isEmpty || part == '.' || part == '..')) {
-                      throw Exception('The Web preview archive contains an unsafe path: ${entry.name}');
-                    }
-                    totalBytes += entry.size;
-                    fileCount++;
-                    if (fileCount > 10000 || totalBytes > 250 * 1024 * 1024) {
-                      throw Exception('The Web preview is too large to open safely (limit: 10,000 files / 250 MB).');
-                    }
-                    final targetFile = File('${previewDir.path}${Platform.pathSeparator}${segments.join(Platform.pathSeparator)}');
-                    await targetFile.parent.create(recursive: true);
-                    await targetFile.writeAsBytes(entry.content as List<int>, flush: false);
-                    if (normalized == 'index.html') hasIndex = true;
-                  }
-                  if (!hasIndex) throw Exception('The Web preview did not contain index.html. The Flutter Web build may be incomplete.');
-                  _updateProgress(100, Duration.zero, 'Flutter Web preview ready');
-                  _setStatus('Web preview built successfully. This runs the Flutter Web version only; some native-only plugins may not work in a Web preview.');
-                  if (mounted) {
-                    await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => LivePreviewScreen(
-                      root: previewDir,
-                      title: '${_name.text.trim()} — Live App',
-                    )));
-                  }
-                  if (mounted) setState(() {
-                    _progressPercent = 100;
-                    _progressStep = 'Web preview opened';
-                    _remainingEstimate = Duration.zero;
-                    _estimatedFinishAt = DateTime.now();
-                    _status = 'Flutter Web preview built and opened. No APK/AAB was compiled in this run. Preview assets remain in this app’s private storage.';
-                  });
-                  return;
-                }
-
                 final expectedExtension = outputFormat == 'aab' ? '.aab' : '.apk';
                 ArchiveFile? generated;
                 for (final file in archive.files) {
@@ -2713,7 +3438,7 @@ jobs:
                   final text = error is WorkflowRunException
                       ? 'GitHub build failed: ${error.message}\nRun: ${error.runUrl}\n${automaticLogs == null ? 'Use “Load build logs” below for step-by-step output.' : 'Automatic log excerpt:\n$automaticLogs'}'
                       : _githubBuildSucceeded
-                          ? 'GitHub build SUCCEEDED, but retrieving or saving ${outputFormat == 'web_preview' ? 'the Web preview' : outputFormat.toUpperCase()} failed: $detail\nThe build itself did not fail. Use “Load build logs” or open the successful run in GitHub.'
+                          ? 'GitHub build SUCCEEDED, but retrieving or saving ${outputFormat.toUpperCase()} failed: $detail\nThe build itself did not fail. Use “Load build logs” or open the successful run in GitHub.'
                           : 'Build could not complete: $detail${_lastRunUrl == null ? '' : '\nRun: $_lastRunUrl'}';
                   setState(() => _status = text);
                 }
@@ -2853,11 +3578,6 @@ jobs:
                 controlsBuilder: (context, details) => Padding(
                   padding: const EdgeInsets.only(top: 16),
                   child: Wrap(spacing: 10, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
-                    if (_step == 3) OutlinedButton.icon(
-                      onPressed: _building ? null : () => _buildAndDownload(requestedFormat: 'web_preview'),
-                      icon: const Icon(Icons.preview_outlined),
-                      label: const Text('Preview Flutter'),
-                    ),
                     FilledButton.icon(
                       onPressed: _building ? null : details.onStepContinue,
                       icon: Icon(_step == 3 ? Icons.rocket_launch_outlined : Icons.arrow_forward),
@@ -2907,7 +3627,7 @@ jobs:
                         ),
                       )) else const Center(child: Icon(Icons.image_outlined, size: 80)),
                       const SizedBox(height: 10),
-                      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() { _iconBytes = null; _iconPreviewBytes = null; }), icon: const Icon(Icons.delete_outline))]),
+                      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () { setState(() { _iconBytes = null; _iconPreviewBytes = null; }); _scheduleDraftSave(); }, icon: const Icon(Icons.delete_outline))]),
                       const SizedBox(height: 12),
                       Card(
                         color: Theme.of(context).colorScheme.surfaceContainerLow,
@@ -2942,7 +3662,7 @@ jobs:
                         value: _selectedTemplate,
                         decoration: const InputDecoration(labelText: 'Starting template'),
                         items: const [
-                          DropdownMenuItem(value: 'Material 3 starter', child: Text('Material 3 starter (two files)')),
+                          DropdownMenuItem(value: 'Material 3 starter', child: Text('Material 3 app starter (5 files)')),
                           DropdownMenuItem(value: 'Counter example', child: Text('Counter example')),
                           DropdownMenuItem(value: 'Blank screen', child: Text('Blank screen')),
                           DropdownMenuItem(value: 'Custom project', child: Text('Custom project (keep my files)')),
@@ -3101,163 +3821,6 @@ jobs:
             );
           }
 
-          class LivePreviewScreen extends StatefulWidget {
-            const LivePreviewScreen({super.key, required this.root, required this.title});
-            final Directory root;
-            final String title;
-
-            @override
-            State<LivePreviewScreen> createState() => _LivePreviewScreenState();
-          }
-
-          class _LivePreviewScreenState extends State<LivePreviewScreen> {
-            HttpServer? _server;
-            WebViewController? _controller;
-            String? _error;
-            bool _loading = true;
-            Uri? _previewUri;
-
-            @override
-            void initState() {
-              super.initState();
-              unawaited(_startPreviewServer());
-            }
-
-            Future<void> _startPreviewServer() async {
-              final previousServer = _server;
-              if (previousServer != null) {
-                try { await previousServer.close(force: true); } catch (_) {}
-                _server = null;
-              }
-              if (mounted) setState(() { _loading = true; _error = null; _controller = null; });
-              try {
-                if (!await File('${widget.root.path}${Platform.pathSeparator}index.html').exists()) {
-                  throw Exception('Preview index.html was not found in ${widget.root.path}.');
-                }
-                final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0, shared: false);
-                _server = server;
-                unawaited(server.forEach(_serveRequest));
-                final uri = Uri.parse('http://127.0.0.1:${server.port}/index.html');
-                final controller = WebViewController();
-                await controller.setJavaScriptMode(JavaScriptMode.unrestricted);
-                await controller.setNavigationDelegate(NavigationDelegate(
-                  onNavigationRequest: (request) {
-                    final target = Uri.tryParse(request.url);
-                    if (target != null && target.scheme == 'http' && target.host == '127.0.0.1' && target.port == server.port) {
-                      return NavigationDecision.navigate;
-                    }
-                    // Keep the local preview sandboxed to its own web bundle.
-                    return NavigationDecision.prevent;
-                  },
-                  onWebResourceError: (error) {
-                    if (error.isForMainFrame == true && mounted) setState(() => _error = 'Preview page error: ${error.description}');
-                  },
-                ));
-                _previewUri = uri;
-                _controller = controller;
-                await controller.loadRequest(uri);
-                if (mounted) setState(() { _loading = false; _error = null; });
-              } catch (error) {
-                if (mounted) setState(() { _loading = false; _error = error.toString(); });
-              }
-            }
-
-            Future<void> _serveRequest(HttpRequest request) async {
-              try {
-                final raw = request.uri.path == '/' ? 'index.html' : Uri.decodeComponent(request.uri.path.substring(1));
-                final segments = raw.replaceAll('\\', '/').split('/');
-                if (raw.startsWith('/') || segments.any((part) => part.isEmpty || part == '.' || part == '..') || raw.contains('\\')) {
-                  request.response.statusCode = HttpStatus.badRequest;
-                  await request.response.close();
-                  return;
-                }
-                final file = File('${widget.root.path}${Platform.pathSeparator}${segments.join(Platform.pathSeparator)}');
-                if (!await file.exists()) {
-                  request.response.statusCode = HttpStatus.notFound;
-                  request.response.headers.set(HttpHeaders.contentTypeHeader, 'text/plain; charset=utf-8');
-                  request.response.write('Not found: $raw');
-                  await request.response.close();
-                  return;
-                }
-                final extension = raw.contains('.') ? raw.split('.').last.toLowerCase() : '';
-                const mimeTypes = <String, String>{
-                  'html': 'text/html; charset=utf-8',
-                  'js': 'application/javascript; charset=utf-8',
-                  'mjs': 'application/javascript; charset=utf-8',
-                  'css': 'text/css; charset=utf-8',
-                  'json': 'application/json; charset=utf-8',
-                  'wasm': 'application/wasm',
-                  'svg': 'image/svg+xml',
-                  'png': 'image/png',
-                  'jpg': 'image/jpeg',
-                  'jpeg': 'image/jpeg',
-                  'webp': 'image/webp',
-                  'ico': 'image/x-icon',
-                  'woff': 'font/woff',
-                  'woff2': 'font/woff2',
-                  'ttf': 'font/ttf',
-                  'txt': 'text/plain; charset=utf-8',
-                  'xml': 'application/xml; charset=utf-8',
-                };
-                request.response.headers.set(HttpHeaders.contentTypeHeader, mimeTypes[extension] ?? 'application/octet-stream');
-                request.response.headers.set('X-Content-Type-Options', 'nosniff');
-                await request.response.addStream(file.openRead());
-                await request.response.close();
-              } catch (_) {
-                try { request.response.statusCode = HttpStatus.internalServerError; await request.response.close(); } catch (_) {}
-              }
-            }
-
-            Future<void> _retryPreview() async {
-              if (_controller == null || _previewUri == null) {
-                await _startPreviewServer();
-              } else {
-                await _reload();
-              }
-            }
-
-            Future<void> _reload() async {
-              final controller = _controller;
-              final uri = _previewUri;
-              if (controller == null || uri == null) return;
-              setState(() { _loading = true; _error = null; });
-              try {
-                await controller.reload();
-              } catch (error) {
-                if (mounted) setState(() => _error = error.toString());
-              } finally {
-                if (mounted) setState(() => _loading = false);
-              }
-            }
-
-            @override
-            void dispose() {
-              final server = _server;
-              if (server != null) unawaited(server.close(force: true));
-              super.dispose();
-            }
-
-            @override
-            Widget build(BuildContext context) => Scaffold(
-              appBar: AppBar(title: Text(widget.title), actions: [IconButton(tooltip: 'Reload or retry preview', onPressed: _retryPreview, icon: const Icon(Icons.refresh))]),
-              body: Column(children: [
-                if (_loading) const LinearProgressIndicator(),
-                if (_error != null && _controller != null) Padding(padding: const EdgeInsets.all(10), child: SelectableText(_error!)),
-                Expanded(child: _controller != null
-                  ? WebViewWidget(controller: _controller!)
-                  : _loading
-                    ? const Center(child: CircularProgressIndicator())
-                    : Center(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisSize: MainAxisSize.min, children: [
-                        const Icon(Icons.web_asset_off, size: 48),
-                        const SizedBox(height: 12),
-                        Text(_error ?? 'Could not start the local preview.'),
-                        const SizedBox(height: 12),
-                        FilledButton.icon(onPressed: _retryPreview, icon: const Icon(Icons.refresh), label: const Text('Retry preview')),
-                      ])))),
-              ]),
-            );
-          }
-
           class CodeEditorScreen extends StatefulWidget {
             const CodeEditorScreen({super.key, required this.title, required this.initialText, required this.kind});
             final String title;
@@ -3356,12 +3919,12 @@ jobs:
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
-          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
-          DART_CODE: ${{ github.event.client_payload.dart_code }}
-          SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
+          PROJECT_NAME: ${{ steps.app_payload.outputs.project_name }}
+          PACKAGE_NAME: ${{ steps.app_payload.outputs.package_name }}
+          DART_CODE: ${{ steps.app_payload.outputs.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ steps.app_payload.outputs.source_archive_base64 }}
           SOURCE_ARCHIVE_PATH: ${{ github.workspace }}/.simple-app-builder/source.zip
-          DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
+          DEPENDENCIES: ${{ steps.app_payload.outputs.dependencies }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3467,12 +4030,12 @@ jobs:
           python3 "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" "$TARGET_DIR"
 
       - name: Apply selected image or repository logo.png to Android launcher icons
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format != 'web_preview' }}
+        if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          ICON_PATH: ${{ github.event.client_payload.icon.path }}
-          HAS_CUSTOM_ICON: ${{ github.event.client_payload.icon.custom }}
-          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.options.dynamic_themed_icon }}
+          ICON_PATH: ${{ steps.app_payload.outputs.icon_path }}
+          HAS_CUSTOM_ICON: ${{ steps.app_payload.outputs.has_custom_icon }}
+          DYNAMIC_THEMED_ICON: ${{ steps.app_payload.outputs.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3522,7 +4085,7 @@ jobs:
           echo 'Applied color and adaptive launcher icons. Source colors were preserved; no background removal was performed.'
 
       - name: Configure Android release signing (optional)
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.sign_release == true && (github.event.client_payload.options.build_format == '' || github.event.client_payload.options.build_format == 'apk' || github.event.client_payload.options.build_format == 'aab') }}
+        if: ${{ github.event_name == 'repository_dispatch' && steps.app_payload.outputs.sign_release == 'true' && (steps.app_payload.outputs.build_format == 'apk' || steps.app_payload.outputs.build_format == 'aab') }}
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -3686,8 +4249,8 @@ jobs:
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          BUILD_FORMAT: ${{ github.event.client_payload.options.build_format }}
-          SIGN_RELEASE: ${{ github.event.client_payload.options.sign_release }}
+          BUILD_FORMAT: ${{ steps.app_payload.outputs.build_format }}
+          SIGN_RELEASE: ${{ steps.app_payload.outputs.sign_release }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3695,12 +4258,6 @@ jobs:
           cd "$TARGET_DIR"
           BUILD_FORMAT="${BUILD_FORMAT:-apk}"
           case "$BUILD_FORMAT" in
-            web_preview)
-              echo 'Building Flutter Web preview. This compiles the source for web; no Android package is created.'
-              flutter create --platforms=web .
-              flutter build web --release --no-pub
-              (cd build/web && zip -q -r "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-web.zip" .)
-              ;;
             aab)
               flutter build appbundle --release --no-pub
               cp build/app/outputs/bundle/release/app-release.aab "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.aab"
@@ -3713,7 +4270,7 @@ jobs:
           esac
 
       - name: Upload generated release APK
-        if: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.options.build_format == '' || github.event.client_payload.options.build_format == 'apk') }}
+        if: ${{ github.event_name == 'repository_dispatch' && steps.app_payload.outputs.build_format == 'apk' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-apk-${{ steps.metadata.outputs.slug }}
@@ -3723,7 +4280,7 @@ jobs:
           compression-level: 0
 
       - name: Upload generated Android App Bundle
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format == 'aab' }}
+        if: ${{ github.event_name == 'repository_dispatch' && steps.app_payload.outputs.build_format == 'aab' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-aab-${{ steps.metadata.outputs.slug }}
@@ -3732,12 +4289,3 @@ jobs:
           retention-days: 30
           compression-level: 0
 
-      - name: Upload generated Flutter Web preview
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format == 'web_preview' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: generated-web-${{ steps.metadata.outputs.slug }}
-          path: dist/${{ steps.metadata.outputs.slug }}-web.zip
-          if-no-files-found: error
-          retention-days: 7
-          compression-level: 0
