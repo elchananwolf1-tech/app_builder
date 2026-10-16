@@ -37,6 +37,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import os, re, sys
+          from pathlib import Path
           name = os.environ.get('PROJECT_NAME', '').strip()
           package = os.environ.get('PACKAGE_NAME', '').strip()
           source = os.environ.get('DART_CODE', '')
@@ -48,16 +49,17 @@ jobs:
               sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
           # This validator runs only for app-created repository_dispatch events.
           # Manual workflow_dispatch builds the builder APK and has no project inputs.
-          if not bundle and not source.strip():
-              sys.exit('The mobile builder must send source_archive_base64 or dart_code for an app build.')
+          source_zip = Path('.simple-app-builder/source.zip')
+          if not bundle and not source.strip() and not source_zip.is_file():
+              sys.exit('No source was supplied and .simple-app-builder/source.zip is missing from this repository. Open the project in Simple App Builder and retry the build.')
           if bundle and source.strip():
               sys.exit('Provide either source_archive_base64 or dart_code, not both.')
           if os.environ.get('HAS_CUSTOM_ICON', '').lower() == 'true':
               icon_path = os.environ.get('ICON_PATH', '').strip()
               if not re.fullmatch(r'\.simple-app-builder/icons/[0-9]+-[0-9]+\.png', icon_path):
                   sys.exit('Custom icon path is missing or invalid. Select the icon again and retry.')
-          if bundle and (len(bundle) > 55000 or not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle)):
-              sys.exit('source_archive_base64 is invalid or too large. Repack a smaller project; the compressed payload must be at most 55,000 characters.')
+          if bundle and not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle):
+              sys.exit('source_archive_base64 contains invalid characters.')
           if len(source.encode('utf-8')) > 50000:
               sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
           for dep in re.split(r'[,;\s]+', deps.strip()):
@@ -134,6 +136,97 @@ jobs:
           data = data.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 23')
           gradle.write_text(data, encoding='utf-8')
           PY
+          cat > "$RUNNER_TEMP/prepare_launcher_icons.py" <<'PYICON'
+          import math, sys
+          from collections import deque
+          from pathlib import Path
+          from PIL import Image, ImageOps
+
+          source_path = Path(sys.argv[1])
+          output_dir = Path(sys.argv[2])
+          output_dir.mkdir(parents=True, exist_ok=True)
+          try:
+              opened = Image.open(source_path)
+              if opened.width < 1 or opened.height < 1 or opened.width * opened.height > 40000000:
+                  raise ValueError(f'unsupported image dimensions {opened.width}x{opened.height}; maximum is 40 megapixels')
+              image = ImageOps.exif_transpose(opened).convert('RGBA')
+          except Exception as exc:
+              raise SystemExit(f'Could not decode launcher image {source_path}: {exc}')
+          image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+          if image.width < 1 or image.height < 1:
+              raise SystemExit('Launcher image has zero dimensions.')
+
+          # The legacy/color icon uses a neutral white tile. Adaptive and themed icons
+          # use a separate transparent silhouette, which is what Android can tint.
+          color_canvas = Image.new('RGBA', (1024, 1024), (255, 255, 255, 255))
+          color_image = image.copy()
+          visible_color_bbox = color_image.getchannel('A').getbbox()
+          if visible_color_bbox is not None:
+              color_image = color_image.crop(visible_color_bbox)
+          color_image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+          color_canvas.alpha_composite(color_image, ((1024 - color_image.width) // 2, (1024 - color_image.height) // 2))
+          color_canvas.convert('RGB').save(output_dir / 'app_icon.png', format='PNG', optimize=True)
+
+          foreground = image.copy()
+          alpha = foreground.getchannel('A')
+          if alpha.getextrema() == (255, 255):
+              # Opaque source? Try to remove a flat background connected to the image
+              # edges (typically white, black or a brand-color canvas). Complex/photo
+              # backgrounds cannot be separated reliably; transparent source images are best.
+              px = foreground.load()
+              w, h = foreground.size
+              samples = [px[0, 0][:3], px[w - 1, 0][:3], px[0, h - 1][:3], px[w - 1, h - 1][:3]]
+              bg = tuple(round(sum(c[i] for c in samples) / len(samples)) for i in range(3))
+              corner_spread = max(math.sqrt(sum((c[i] - bg[i]) ** 2 for i in range(3))) for c in samples)
+              if corner_spread <= 55:
+                  threshold = 62.0
+                  seen = bytearray(w * h)
+                  queue = deque()
+                  def distance(x, y):
+                      c = px[x, y]
+                      return math.sqrt((c[0] - bg[0]) ** 2 + (c[1] - bg[1]) ** 2 + (c[2] - bg[2]) ** 2)
+                  def enqueue(x, y):
+                      idx = y * w + x
+                      if not seen[idx] and distance(x, y) <= threshold:
+                          seen[idx] = 1
+                          queue.append((x, y))
+                  for x in range(w):
+                      enqueue(x, 0)
+                      enqueue(x, h - 1)
+                  for y in range(h):
+                      enqueue(0, y)
+                      enqueue(w - 1, y)
+                  while queue:
+                      x, y = queue.popleft()
+                      d = distance(x, y)
+                      old = px[x, y]
+                      # Gentle edge alpha preserves anti-aliased contours rather than
+                      # leaving a hard rectangle around a logo on a flat background.
+                      new_alpha = round(old[3] * max(0.0, min(1.0, (d - 8.0) / (threshold - 8.0))))
+                      px[x, y] = (old[0], old[1], old[2], new_alpha)
+                      if x > 0: enqueue(x - 1, y)
+                      if x + 1 < w: enqueue(x + 1, y)
+                      if y > 0: enqueue(x, y - 1)
+                      if y + 1 < h: enqueue(x, y + 1)
+              else:
+                  print('WARNING: logo has a complex opaque background; automatic monochrome extraction may include it. A transparent-background logo.png is recommended.', file=sys.stderr)
+
+          bbox = foreground.getchannel('A').getbbox()
+          if bbox is None:
+              raise SystemExit('Could not detect visible logo pixels after background processing. Use a logo with a transparent background or a clear solid background.')
+          foreground = foreground.crop(bbox)
+          foreground.thumbnail((768, 768), Image.Resampling.LANCZOS)
+          foreground_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+          foreground_canvas.alpha_composite(foreground, ((1024 - foreground.width) // 2, (1024 - foreground.height) // 2))
+          foreground_canvas.save(output_dir / 'app_icon_foreground.png', format='PNG', optimize=True)
+
+          # Android 13+ themed icons use the alpha silhouette as a mask. The system
+          # applies its own theme color; RGB is deliberately white and transparent elsewhere.
+          monochrome = Image.new('RGBA', (1024, 1024), (255, 255, 255, 0))
+          monochrome.putalpha(foreground_canvas.getchannel('A'))
+          monochrome.save(output_dir / 'app_icon_monochrome.png', format='PNG', optimize=True)
+          print('Generated color, adaptive foreground, and monochrome themed launcher icon assets.')
+          PYICON
 
       - name: Generate the real Simple App Builder application
         if: ${{ github.event_name == 'workflow_dispatch' }}
@@ -226,6 +319,7 @@ jobs:
               this.additionalFiles = const {},
               this.dependencies = '',
               this.iconBase64,
+              this.repository = '',
             });
 
             final String id;
@@ -238,6 +332,8 @@ jobs:
             // Explicit packages supplement packages discovered from Dart imports.
             final String dependencies;
             final String? iconBase64;
+            // Each app has an isolated, private GitHub repository for its source, icon, workflow and artifact.
+            final String repository;
 
             AppProject copyWith({
               String? name,
@@ -246,6 +342,7 @@ jobs:
               Map<String, String>? additionalFiles,
               String? dependencies,
               String? iconBase64,
+              String? repository,
               bool clearIcon = false,
             }) => AppProject(
                   id: id,
@@ -255,6 +352,7 @@ jobs:
                   additionalFiles: additionalFiles ?? this.additionalFiles,
                   dependencies: dependencies ?? this.dependencies,
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
+                  repository: repository ?? this.repository,
                 );
 
             Map<String, dynamic> toJson() => {
@@ -265,6 +363,7 @@ jobs:
                   'additionalFiles': additionalFiles,
                   'dependencies': dependencies,
                   'iconBase64': iconBase64,
+                  'repository': repository,
                 };
 
             factory AppProject.fromJson(Map<String, dynamic> json) {
@@ -283,6 +382,7 @@ jobs:
                 additionalFiles: files,
                 dependencies: (json['dependencies'] ?? '').toString(),
                 iconBase64: json['iconBase64']?.toString(),
+                repository: (json['repository'] ?? '').toString(),
               );
             }
           }
@@ -417,6 +517,10 @@ jobs:
             String toString() => message;
           }
 
+          String normalizeRepository(String value) => value.trim().replaceAll(RegExp(r'\s*/\s*'), '/');
+
+          bool isValidRepository(String value) => RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(normalizeRepository(value));
+
           class GitHubApi {
             GitHubApi({
               required this.repository,
@@ -430,7 +534,21 @@ jobs:
             final bool autoFailover;
             final void Function(GitHubAccount account)? onPromote;
 
-            String get _repoPath => '/repos/$repository';
+            String get _repoPath {
+              final normalized = normalizeRepository(repository);
+              final parts = normalized.split('/');
+              if (parts.length != 2 || parts.any((part) => part.isEmpty || part.contains(' '))) {
+                throw FormatException('Invalid GitHub repository "$repository". Use owner/repository without spaces.');
+              }
+              return '/repos/${Uri.encodeComponent(parts[0])}/${Uri.encodeComponent(parts[1])}';
+            }
+
+            GitHubApi forRepository(String value) => GitHubApi(
+              repository: normalizeRepository(value),
+              accounts: accounts,
+              autoFailover: autoFailover,
+              onPromote: onPromote,
+            );
 
             Future<http.Response> request(
               String method,
@@ -502,6 +620,9 @@ jobs:
               if (response.statusCode < 200 || response.statusCode >= 300) {
                 final message = (parsed is Map ? (parsed['message'] ?? response.body) : response.body).toString();
                 final excerpt = message.length > 350 ? message.substring(0, 350) : message;
+                if (response.statusCode == 404) {
+                  throw Exception('GitHub API 404 for repository "${normalizeRepository(repository)}": $excerpt. Verify the exact owner/repository and confirm this token can access it. If this is the workflow template repository, verify it in Settings; if it is a project repository, confirm creation finished and the token has repo + workflow scopes. Spaces around / are normalized automatically.');
+                }
                 throw Exception('GitHub API ${response.statusCode}: $excerpt');
               }
               if (parsed is! Map<String, dynamic>) throw Exception('GitHub returned an unexpected response.');
@@ -513,6 +634,26 @@ jobs:
               return (json['default_branch'] ?? 'main').toString();
             }
 
+            Future<Map<String, dynamic>> createPrivateRepository(String name, {String? description}) async {
+              final cleaned = name.trim();
+              if (!RegExp(r'^[A-Za-z0-9_.-]{1,100}$').hasMatch(cleaned)) {
+                throw Exception('Repository name must use only letters, digits, periods, underscores or hyphens (max 100 characters).');
+              }
+              final response = await request('POST', '/user/repos', body: {
+                'name': cleaned,
+                'description': description ?? 'Flutter app generated with Simple App Builder',
+                'private': true,
+                'auto_init': true,
+                'has_issues': true,
+                'has_wiki': false,
+                'has_projects': false,
+              });
+              final created = checkedJson(response);
+              final fullName = (created['full_name'] ?? '').toString();
+              if (fullName.isEmpty) throw Exception('GitHub created the repository but did not return owner/repository.');
+              return created;
+            }
+
             Future<String> readWorkflow(String branch) async {
               final uriPath = '$_repoPath/contents/.github/workflows/$workflowFile?ref=${Uri.encodeQueryComponent(branch)}';
               final json = checkedJson(await request('GET', uriPath));
@@ -521,14 +662,76 @@ jobs:
             }
 
             Future<void> saveWorkflow(String branch, String source) async {
-              final uriPath = '$_repoPath/contents/.github/workflows/$workflowFile?ref=${Uri.encodeQueryComponent(branch)}';
-              final current = checkedJson(await request('GET', uriPath));
-              checkedJson(await request('PUT', '$_repoPath/contents/.github/workflows/$workflowFile', body: {
-                'message': 'Update build workflow from Simple App Builder',
+              final filePath = '$_repoPath/contents/.github/workflows/$workflowFile';
+              final current = await request('GET', '$filePath?ref=${Uri.encodeQueryComponent(branch)}');
+              String? sha;
+              if (current.statusCode == 200) {
+                final json = jsonDecode(current.body) as Map<String, dynamic>;
+                sha = json['sha']?.toString();
+              } else if (current.statusCode != 404) {
+                checkedJson(current);
+              }
+              final body = <String, dynamic>{
+                'message': sha == null ? 'Install Simple App Builder workflow' : 'Update build workflow from Simple App Builder',
                 'content': base64Encode(utf8.encode(source)),
                 'branch': branch,
-                'sha': current['sha'],
-              }));
+              };
+              if (sha != null && sha.isNotEmpty) body['sha'] = sha;
+              checkedJson(await request('PUT', filePath, body: body));
+            }
+
+            Future<Uint8List?> readRootLogo(String branch) async {
+              final response = await request('GET', '$_repoPath/contents/logo.png?ref=${Uri.encodeQueryComponent(branch)}');
+              if (response.statusCode == 404) return null;
+              final json = checkedJson(response);
+              final encoded = (json['content'] ?? '').toString().replaceAll(RegExp(r'\s'), '');
+              if (encoded.isEmpty) {
+                final reportedSize = (json['size'] as num?)?.toInt() ?? 0;
+                if (reportedSize > 0) {
+                  throw Exception('GitHub did not return the contents of logo.png (reported size: $reportedSize bytes). Keep logo.png under 1 MB or reduce its size, then retry.');
+                }
+                return null;
+              }
+              final bytes = Uint8List.fromList(base64.decode(encoded));
+              if (bytes.length > 8 * 1024 * 1024) {
+                throw Exception('The template logo.png exceeds 8 MB. Optimize the logo before building.');
+              }
+              return bytes;
+            }
+
+            Future<void> saveRootLogoIfMissing(String branch, Uint8List bytes) async {
+              final filePath = '$_repoPath/contents/logo.png';
+              final current = await request('GET', '$filePath?ref=${Uri.encodeQueryComponent(branch)}');
+              if (current.statusCode == 200) {
+                // Never overwrite an existing per-project logo; it may be intentional.
+                return;
+              }
+              if (current.statusCode != 404) checkedJson(current);
+              final body = <String, dynamic>{
+                'message': 'Add default launcher logo from Simple App Builder template',
+                'content': base64Encode(bytes),
+                'branch': branch,
+              };
+              checkedJson(await request('PUT', filePath, body: body));
+            }
+
+            Future<void> saveProjectSourceArchive(String branch, Uint8List bytes) async {
+              const filePath = '.simple-app-builder/source.zip';
+              final path = '$_repoPath/contents/$filePath?ref=${Uri.encodeQueryComponent(branch)}';
+              final existing = await request('GET', path);
+              String? sha;
+              if (existing.statusCode == 200) {
+                sha = (jsonDecode(existing.body) as Map<String, dynamic>)['sha']?.toString();
+              } else if (existing.statusCode != 404) {
+                checkedJson(existing);
+              }
+              final body = <String, dynamic>{
+                'message': 'Save current Dart source archive from Simple App Builder',
+                'content': base64Encode(bytes),
+                'branch': branch,
+              };
+              if (sha != null && sha.isNotEmpty) body['sha'] = sha;
+              checkedJson(await request('PUT', '$_repoPath/contents/$filePath', body: body));
             }
 
             Future<void> uploadProjectIcon(String branch, String filePath, Uint8List bytes) async {
@@ -569,7 +772,6 @@ jobs:
             Future<void> dispatchBuild({
               required String projectName,
               required String packageName,
-              required String sourceArchiveBase64,
               required String dependencies,
               required bool hasCustomIcon,
               required String iconPath,
@@ -582,7 +784,6 @@ jobs:
                 'client_payload': {
                   'project_name': projectName,
                   'package_name': packageName,
-                  'source_archive_base64': sourceArchiveBase64,
                   'dependencies': dependencies,
                   'has_custom_icon': hasCustomIcon,
                   'icon_path': iconPath,
@@ -595,49 +796,138 @@ jobs:
               }
             }
 
-            Future<int> latestWorkflowRunNumber() async {
-              final result = checkedJson(await request(
-                'GET',
-                '$_repoPath/actions/workflows/$workflowFile/runs?event=repository_dispatch&per_page=1',
-              ));
-              final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
-                  .whereType<Map<String, dynamic>>()
-                  .toList();
-              if (runs.isEmpty) return 0;
-              return (runs.first['run_number'] as int?) ?? 0;
+            int _typicalStepSeconds(String name) {
+              final value = name.toLowerCase();
+              if (value.contains('checkout')) return 8;
+              if (value.contains('validate')) return 3;
+              if (value.contains('prepare artifact')) return 2;
+              if (value.contains('java')) return 12;
+              if (value.contains('flutter stable')) return 45;
+              if (value.contains('patch helper')) return 2;
+              if (value.contains('create the requested flutter project')) return 28;
+              if (value.contains('apply selected image')) return 30;
+              if (value.contains('build generated release apk')) return 150;
+              if (value.contains('upload generated release apk')) return 10;
+              if (value.contains('generate the real simple app builder')) return 120;
+              if (value.contains('upload simple app builder')) return 8;
+              return 25;
+            }
+
+            int? _stepDurationSeconds(Map<String, dynamic> step) {
+              final start = DateTime.tryParse((step['started_at'] ?? '').toString());
+              final end = DateTime.tryParse((step['completed_at'] ?? '').toString());
+              if (start == null || end == null) return null;
+              final value = end.difference(start).inSeconds;
+              return value < 1 ? 1 : value;
+            }
+
+            Future<Map<String, dynamic>?> readRunProgress(String runId) async {
+              try {
+                final json = checkedJson(await request('GET', '$_repoPath/actions/runs/$runId/jobs?per_page=100'));
+                final jobs = (json['jobs'] as List<dynamic>? ?? const []).whereType<Map<String, dynamic>>();
+                final steps = <Map<String, dynamic>>[];
+                for (final job in jobs) {
+                  final jobSteps = job['steps'];
+                  if (jobSteps is List) steps.addAll(jobSteps.whereType<Map<String, dynamic>>());
+                }
+                if (steps.isEmpty) return null;
+                final now = DateTime.now().toUtc();
+                var completedSeconds = 0;
+                var totalSeconds = 0;
+                var remainingSeconds = 0;
+                var activeName = 'Running GitHub Actions steps';
+                for (final step in steps) {
+                  final name = (step['name'] ?? 'Build step').toString();
+                  final status = (step['status'] ?? 'queued').toString();
+                  final conclusion = (step['conclusion'] ?? '').toString();
+                  if (status == 'completed' && conclusion == 'skipped') continue;
+                  final typical = _typicalStepSeconds(name);
+                  if (status == 'completed') {
+                    final actual = _stepDurationSeconds(step) ?? typical;
+                    completedSeconds += actual;
+                    totalSeconds += actual;
+                  } else if (status == 'in_progress') {
+                    activeName = name;
+                    final started = DateTime.tryParse((step['started_at'] ?? '').toString());
+                    final elapsed = started == null ? 0 : now.difference(started.toUtc()).inSeconds.clamp(0, 36000).toInt();
+                    final expected = elapsed >= typical ? elapsed + (typical ~/ 4).clamp(8, 45).toInt() : typical;
+                    completedSeconds += elapsed;
+                    totalSeconds += expected;
+                    remainingSeconds += (expected - elapsed).clamp(0, 36000).toInt();
+                  } else {
+                    totalSeconds += typical;
+                    remainingSeconds += typical;
+                  }
+                }
+                var percent = totalSeconds <= 0 ? 3 : (completedSeconds * 100 / totalSeconds).round();
+                if (percent < 3) percent = 3;
+                if (percent > 96) percent = 96;
+                return {
+                  'percent': percent,
+                  'remainingSeconds': remainingSeconds,
+                  'step': activeName,
+                };
+              } catch (_) {
+                // Progress telemetry is best-effort. It must never fail a working build.
+                return null;
+              }
             }
 
             Future<Map<String, dynamic>> waitForBuild(
-              int previousRunNumber,
               String requestId,
               void Function(String message) onStatus,
+              void Function(Map<String, dynamic> run, int percent, Duration? remaining, String step) onProgress,
             ) async {
+              final pollingStarted = DateTime.now();
               for (var attempt = 0; attempt < 360; attempt++) {
                 await Future<void>.delayed(const Duration(seconds: 5));
-                final result = checkedJson(await request(
+                final runsResponse = await request(
                   'GET',
-                  '$_repoPath/actions/workflows/$workflowFile/runs?event=repository_dispatch&per_page=50',
-                ));
+                  '$_repoPath/actions/runs?event=repository_dispatch&per_page=50',
+                );
+                if (runsResponse.statusCode == 404) {
+                  onStatus('GitHub accepted the request; waiting for the new repository Actions workflow to appear…');
+                  final elapsed = DateTime.now().difference(pollingStarted).inSeconds;
+                  final Duration? remaining = elapsed >= 210 ? null : Duration(seconds: 240 - elapsed);
+                  onProgress({'id': '', 'html_url': '', 'run_number': 0}, 2, remaining, 'Waiting for GitHub to initialize Actions');
+                  continue;
+                }
+                final result = checkedJson(runsResponse);
                 final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
                     .whereType<Map<String, dynamic>>()
-                    .where((run) =>
-                        ((run['run_number'] as int?) ?? 0) > previousRunNumber &&
-                        (run['display_title'] ?? '').toString() == requestId)
+                    .where((run) => (run['display_title'] ?? '').toString() == requestId)
                     .toList()
                   ..sort((a, b) => (b['run_number'] as int? ?? 0).compareTo(a['run_number'] as int? ?? 0));
                 if (runs.isEmpty) {
                   onStatus('Waiting for GitHub to register the build…');
+                  final elapsed = DateTime.now().difference(pollingStarted).inSeconds;
+                  final Duration? remaining = elapsed >= 210 ? null : Duration(seconds: 240 - elapsed);
+                  onProgress({'id': '', 'html_url': '', 'run_number': 0}, 2, remaining, 'Waiting for GitHub to register the build');
                   continue;
                 }
                 final run = runs.first;
                 final status = (run['status'] ?? 'queued').toString();
                 final number = run['run_number']?.toString() ?? '';
+                final runId = (run['id'] ?? '').toString();
                 onStatus('Workflow #$number: $status');
+                Map<String, dynamic>? snapshot;
+                if (runId.isNotEmpty) snapshot = await readRunProgress(runId);
+                if (status == 'queued' || snapshot == null) {
+                  final created = DateTime.tryParse((run['created_at'] ?? '').toString());
+                  final queuedElapsed = created == null ? 0 : DateTime.now().toUtc().difference(created.toUtc()).inSeconds;
+                  final Duration? remaining = queuedElapsed >= 240
+                    ? null
+                    : Duration(seconds: (240 - queuedElapsed) < 25 ? 25 : 240 - queuedElapsed);
+                  onProgress(run, status == 'queued' ? 3 : 8, remaining, status == 'queued' ? 'Waiting for a GitHub runner' : 'Starting build steps and estimating duration');
+                } else {
+                  onProgress(run, (snapshot['percent'] as int?) ?? 8, Duration(seconds: (snapshot['remainingSeconds'] as int?) ?? 120), (snapshot['step'] ?? 'Building').toString());
+                }
                 if (status == 'completed') {
                   if (run['conclusion'] != 'success') {
                     final url = (run['html_url'] ?? '').toString();
-                    throw WorkflowRunException(message: 'GitHub Actions concluded the build as ${run['conclusion'] ?? 'failure'}. Open the run or load its logs below.', runId: (run['id'] ?? '').toString(), runUrl: url);
+                    throw WorkflowRunException(message: 'GitHub Actions concluded the build as ${run['conclusion'] ?? 'failure'}. Open the run or load its logs below.', runId: runId, runUrl: url);
                   }
+                  onProgress(run, 97, const Duration(seconds: 8), 'Build finished; downloading APK artifact');
                   return run;
                 }
               }
@@ -748,6 +1038,16 @@ jobs:
               if (actual.toLowerCase() != username.trim().toLowerCase()) {
                 return 'This token belongs to "$actual", not "${username.trim()}".';
               }
+              final scopeHeader = (response.headers['x-oauth-scopes'] ?? '').trim();
+              if (scopeHeader.isNotEmpty) {
+                final scopes = scopeHeader.split(',').map((scope) => scope.trim()).where((scope) => scope.isNotEmpty).toSet();
+                final missing = <String>[];
+                if (!scopes.contains('repo')) missing.add('repo');
+                if (!scopes.contains('workflow')) missing.add('workflow');
+                if (missing.isNotEmpty) {
+                  return 'The token is valid but is missing required classic-token scopes: ${missing.join(', ')}. Create a classic token with BOTH repo and workflow scopes so the builder can create private repositories and install the workflow.';
+                }
+              }
               return null;
             } catch (error) {
               return 'Could not verify the account: $error';
@@ -800,7 +1100,7 @@ jobs:
                 _projects = [];
               }
               _autoFailover = prefs.getBool('auto_failover') ?? true;
-              _repository = prefs.getString('repository') ?? compiledRepository;
+              _repository = normalizeRepository(prefs.getString('repository') ?? compiledRepository);
               if (mounted) setState(() => _ready = true);
             }
 
@@ -828,7 +1128,7 @@ jobs:
             }
 
             Future<void> _saveRepository(String repository) async {
-              _repository = repository.trim();
+              _repository = normalizeRepository(repository);
               final prefs = await SharedPreferences.getInstance();
               await prefs.setString('repository', _repository);
               if (mounted) setState(() {});
@@ -972,11 +1272,11 @@ jobs:
                           const SizedBox(height: 24),
                           Text('Create a classic GitHub token', style: Theme.of(context).textTheme.titleLarge),
                           const SizedBox(height: 8),
-                          const SelectableText('1. Sign in to GitHub and open Settings.\n2. Go to Developer settings → Personal access tokens → Tokens (classic).\n3. Select Generate new token (classic), give it a clear name and expiry.\n4. Explicitly check BOTH scopes: repo and workflow.\n5. Generate the token and copy it immediately. GitHub only shows the full value once.\n6. Return here and paste the token. Never commit it to a repository or share it in Dart code.'),
+                          const SelectableText('1. Sign in to GitHub and open Settings.\n2. Go to Developer settings → Personal access tokens → Tokens (classic).\n3. Select Generate new token (classic), give it a clear name and expiry.\n4. Explicitly check BOTH scopes: repo and workflow. repo allows the app to create a private repository and upload project files; workflow allows it to install/update the build workflow.\n5. Generate the token and copy it immediately. GitHub only shows the full value once.\n6. Return here and paste the token. Never commit it to a repository or share it in Dart code. Organization policies may restrict repository creation.'),
                           const SizedBox(height: 10),
                           OutlinedButton.icon(onPressed: () => launchUrl(Uri.parse('https://github.com/settings/tokens/new?scopes=repo,workflow&description=Simple%20App%20Builder'), mode: LaunchMode.externalApplication), icon: const Icon(Icons.open_in_new), label: const Text('Open classic token creation page')),
                           const SizedBox(height: 8),
-                          const Text('The repository must contain .github/workflows/build_apk.yml on its default branch, and GitHub Actions must be enabled.'),
+                          const Text('This connected repository is the workflow template source. For each app, the Builder creates a new private repository under the account represented by the working token, installs build_apk.yml there, and builds the app in isolation. Use a classic personal access token with BOTH repo and workflow scopes. GitHub Actions and repository creation must be allowed by the account or organization policy.'),
                         ],
                       ),
                     ),
@@ -1091,7 +1391,7 @@ jobs:
                             child: ListTile(
                               leading: CircleAvatar(child: project.iconBase64 == null ? const Icon(Icons.phone_android) : ClipOval(child: Image.memory(base64Decode(project.iconBase64!), fit: BoxFit.cover, width: 44, height: 44))),
                               title: Text(project.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                              subtitle: Text(project.packageName, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(project.repository.isNotEmpty ? '${project.packageName} · ${project.repository}' : project.packageName, maxLines: 2, overflow: TextOverflow.ellipsis),
                               onTap: () => _openWizard(project: project),
                               trailing: PopupMenuButton<String>(
                                 tooltip: 'Manage project',
@@ -1217,6 +1517,24 @@ jobs:
               }
             }
 
+            Future<void> _saveRepositorySetting() async {
+              final value = normalizeRepository(_repoController.text);
+              if (!isValidRepository(value)) { _snack('Enter owner/repository, for example elchananwolf1-tech/app_builder. Do not include spaces inside either name.'); return; }
+              setState(() => _busy = true);
+              try {
+                final probe = GitHubApi(repository: value, accounts: widget.accounts, autoFailover: _failover);
+                final branch = await probe.defaultBranch();
+                await probe.readWorkflow(branch);
+                await widget.onRepositoryChanged(value);
+                _repoController.text = value;
+                _snack('Repository verified and saved. The workflow template was found.');
+              } catch (error) {
+                _snack('Repository verification failed: $error');
+              } finally {
+                if (mounted) setState(() => _busy = false);
+              }
+            }
+
             Future<String> _loadWorkflowSource() async {
               final api = widget.apiFactory();
               final branch = await api.defaultBranch();
@@ -1276,16 +1594,11 @@ jobs:
             Widget build(BuildContext context) => Scaffold(
                   appBar: AppBar(title: const Text('Settings')),
                   body: ListView(padding: const EdgeInsets.all(16), children: [
-                    Text('GitHub repository', style: Theme.of(context).textTheme.titleLarge),
+                    Text('Builder workflow template repository', style: Theme.of(context).textTheme.titleLarge),
                     const SizedBox(height: 8),
-                    TextField(controller: _repoController, autocorrect: false, decoration: const InputDecoration(labelText: 'owner/repository', helperText: 'Usually set automatically when this APK is built by the workflow.')),
+                    TextField(controller: _repoController, autocorrect: false, decoration: const InputDecoration(labelText: 'owner/repository', helperText: 'This repository supplies the workflow template. Every app you create gets its own new private repository. Spaces around / are normalized.')),
                     const SizedBox(height: 8),
-                    Align(alignment: Alignment.centerLeft, child: FilledButton.tonal(onPressed: _busy ? null : () async {
-                      final value = _repoController.text.trim();
-                      if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(value)) { _snack('Enter repository as owner/repository.'); return; }
-                      await widget.onRepositoryChanged(value);
-                      _snack('Repository saved.');
-                    }, child: const Text('Save repository'))),
+                    Align(alignment: Alignment.centerLeft, child: FilledButton.tonal(onPressed: _busy ? null : _saveRepositorySetting, child: const Text('Verify and save repository'))),
                     const Divider(height: 32),
                     Text('Accounts and security', style: Theme.of(context).textTheme.titleLarge),
                     SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Auto failover / rate-limit switching'), subtitle: const Text('Retry authentication, rate-limit, and access failures using another saved account.'), value: _failover, onChanged: (value) async { setState(() => _failover = value); await widget.onFailoverChanged(value); }),
@@ -1341,7 +1654,9 @@ jobs:
             late final TextEditingController _name;
             late final TextEditingController _packageName;
             late final TextEditingController _dependencies;
+            late final TextEditingController _repositoryName;
             late final String _projectId;
+            String _targetRepository = '';
             late String _dartCode;
             late Map<String, String> _additionalFiles;
             String _selectedTemplate = 'Material 3 starter';
@@ -1364,6 +1679,14 @@ jobs:
               _name = TextEditingController(text: widget.existing?.name ?? 'My Flutter App');
               _packageName = TextEditingController(text: widget.existing?.packageName ?? 'com.example.myapp');
               _dependencies = TextEditingController(text: widget.existing?.dependencies ?? '');
+              final savedTargetRepository = normalizeRepository(widget.existing?.repository ?? '');
+              _targetRepository = savedTargetRepository;
+              final savedRepoName = savedTargetRepository.contains('/') ? savedTargetRepository.split('/').last : '';
+              final packageLeaf = (widget.existing?.packageName ?? 'com.example.myapp').split('.').last;
+              final fallbackBase = packageLeaf.toLowerCase().replaceAll(RegExp(r'[^a-z0-9_.-]+'), '-').replaceAll(RegExp(r'^[-._]+|[-._]+$'), '');
+              final idSuffix = _projectId.length > 6 ? _projectId.substring(_projectId.length - 6) : _projectId;
+              final fallbackRepoName = '${fallbackBase.isEmpty ? 'flutter-app' : fallbackBase}-$idSuffix';
+              _repositoryName = TextEditingController(text: savedRepoName.isNotEmpty ? savedRepoName : fallbackRepoName);
               if (widget.existing == null) {
                 final starter = _templateFiles(_selectedTemplate);
                 _dartCode = starter['lib/main.dart']!;
@@ -1383,10 +1706,11 @@ jobs:
               _name.dispose();
               _packageName.dispose();
               _dependencies.dispose();
+              _repositoryName.dispose();
               super.dispose();
             }
 
-            AppProject _project() => AppProject(
+            AppProject _project({String? repository}) => AppProject(
               id: _projectId,
               name: _name.text.trim(),
               packageName: _packageName.text.trim(),
@@ -1394,6 +1718,7 @@ jobs:
               additionalFiles: Map<String, String>.from(_additionalFiles),
               dependencies: _dependencies.text.trim(),
               iconBase64: _iconBytes == null ? null : base64Encode(_iconBytes!),
+              repository: normalizeRepository(repository ?? (_targetRepository.isNotEmpty ? _targetRepository : (widget.existing?.repository ?? ''))),
             );
 
             Map<String, String> _allDartFiles() => <String, String>{
@@ -1408,6 +1733,11 @@ jobs:
               }
               if (!RegExp(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$').hasMatch(_packageName.text.trim())) {
                 _message('Package name must be lowercase reverse-DNS format, e.g. com.example.myapp.');
+                return false;
+              }
+              final savedRepository = _targetRepository;
+              if (savedRepository.isEmpty && !RegExp(r'^[A-Za-z0-9_.-]{1,100}$').hasMatch(_repositoryName.text.trim())) {
+                _message('Choose a valid new GitHub repository name: letters, digits, periods, underscores or hyphens.');
                 return false;
               }
               return true;
@@ -1663,77 +1993,173 @@ jobs:
               await _buildAndDownload();
             }
 
+            int _progressPercent = 0;
+            String _progressStep = 'Preparing source files';
+            Duration? _remainingEstimate;
+            DateTime? _estimatedFinishAt;
+
+            String _formatRemaining(Duration? duration) {
+              if (duration == null) return 'Estimating…';
+              final seconds = duration.inSeconds < 0 ? 0 : duration.inSeconds;
+              if (seconds >= 3600) return '${seconds ~/ 3600}h ${(seconds % 3600) ~/ 60}m';
+              if (seconds >= 60) return '${seconds ~/ 60}m ${seconds % 60}s';
+              return '${seconds}s';
+            }
+
+            String _formatFinish(DateTime? value) {
+              if (value == null) return 'estimating finish time';
+              final local = value.toLocal();
+              final h = local.hour.toString().padLeft(2, '0');
+              final m = local.minute.toString().padLeft(2, '0');
+              return '$h:$m';
+            }
+
+            void _updateProgress(int percent, Duration? remaining, String step) {
+              if (!mounted) return;
+              setState(() {
+                final bounded = percent.clamp(0, 100).toInt();
+                if (bounded > _progressPercent) _progressPercent = bounded;
+                _progressStep = step;
+                _remainingEstimate = remaining;
+                _estimatedFinishAt = remaining == null ? null : DateTime.now().add(remaining);
+              });
+            }
+
             Future<void> _buildAndDownload() async {
               if (!_validDetails() || !_validateFileTree()) return;
-              if (widget.repository.isEmpty) { _message('Repository is not configured. Open Settings.'); return; }
-              if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(widget.repository)) {
-                _message('Repository should be owner/repository.');
+              if (widget.repository.isEmpty || !isValidRepository(widget.repository)) {
+                _message('The builder workflow template repository is not configured correctly. Open Settings and verify owner/repository.');
                 return;
               }
               setState(() {
                 _building = true;
-                _status = 'Saving project and preparing source files…';
+                _status = 'Preparing source and verifying the workflow template…';
                 _apkPath = null;
                 _lastRunId = null;
                 _lastRunUrl = null;
                 _githubBuildSucceeded = false;
                 _buildStartedAt = DateTime.now();
+                _progressPercent = 1;
+                _progressStep = 'Preparing Dart files';
+                _remainingEstimate = const Duration(minutes: 5);
+                _estimatedFinishAt = DateTime.now().add(const Duration(minutes: 5));
               });
-              GitHubApi? cleanupApi;
-              String? cleanupBranch;
+              GitHubApi? targetApi;
+              String? targetBranch;
               String? cleanupIconPath;
               try {
-                await widget.onSaveProject(_project());
                 final archiveBytes = _createSourceArchive();
-                final sourceArchiveBase64 = base64Encode(archiveBytes);
-                if (sourceArchiveBase64.length > 55000) {
-                  throw Exception('The compressed Dart project is too large for the GitHub event payload (maximum 55,000 Base64 characters). Remove large/generated files and retry.');
+                if (archiveBytes.length > 5 * 1024 * 1024) {
+                  throw Exception('The compressed Dart project archive exceeds 5 MB. Remove generated or unnecessary files and retry.');
                 }
-                final api = widget.apiFactory();
-                cleanupApi = api;
-                _setStatus('Checking repository and default branch…');
-                final branch = await api.defaultBranch();
-                cleanupBranch = branch;
+
+                final templateApi = widget.apiFactory();
+                _updateProgress(3, const Duration(minutes: 5), 'Reading the builder workflow template');
+                final templateBranch = await templateApi.defaultBranch();
+                final workflowSource = await templateApi.readWorkflow(templateBranch);
+                if (!workflowSource.contains('repository_dispatch') || !workflowSource.contains('build_flutter_app')) {
+                  throw Exception('The configured build_apk.yml does not contain the expected repository_dispatch workflow for app builds. Open Settings and verify the template repository.');
+                }
+
+                await widget.onSaveProject(_project());
+                final existingTarget = normalizeRepository(_targetRepository);
+                String targetRepository;
+                if (existingTarget.isNotEmpty) {
+                  targetRepository = existingTarget;
+                  _updateProgress(6, const Duration(minutes: 4), 'Reusing this app’s private repository');
+                  targetApi = templateApi.forRepository(targetRepository);
+                  targetBranch = await targetApi!.defaultBranch();
+                  // Keep each target repo's workflow synced with the editable template in Settings.
+                  _setStatus('Updating the app repository with the current workflow template…');
+                  await targetApi!.saveWorkflow(targetBranch!, workflowSource);
+                } else {
+                  _updateProgress(5, const Duration(minutes: 4, seconds: 30), 'Creating a new private GitHub repository');
+                  _setStatus('Creating a new private repository “${_repositoryName.text.trim()}”…');
+                  final created = await templateApi.createPrivateRepository(
+                    _repositoryName.text.trim(),
+                    description: 'Private Flutter app source and build workflow for ${_name.text.trim()}',
+                  );
+                  targetRepository = normalizeRepository((created['full_name'] ?? '').toString());
+                  _targetRepository = targetRepository;
+                  if (!isValidRepository(targetRepository)) {
+                    throw Exception('GitHub created the repository but returned an invalid name: "$targetRepository".');
+                  }
+                  targetBranch = (created['default_branch'] ?? 'main').toString();
+                  targetApi = templateApi.forRepository(targetRepository);
+                  // Persist immediately so an interrupted setup can reuse and repair the repo on retry.
+                  await widget.onSaveProject(_project(repository: targetRepository));
+                  _setStatus('Installing build_apk.yml in $targetRepository…');
+                  _updateProgress(8, const Duration(minutes: 4), 'Installing build workflow into the private repository');
+                  await targetApi!.saveWorkflow(targetBranch!, workflowSource);
+                }
+
+                await widget.onSaveProject(_project(repository: targetRepository));
                 final hasCustomIcon = _iconBytes != null;
-                final requestId = '${_name.text.trim()}-${DateTime.now().microsecondsSinceEpoch}';
+                if (!hasCustomIcon) {
+                  _updateProgress(8, const Duration(minutes: 4), 'Ensuring this app repository has a default logo');
+                  final templateLogo = await templateApi.readRootLogo(templateBranch);
+                  if (templateLogo != null && templateLogo.isNotEmpty) {
+                    await targetApi!.saveRootLogoIfMissing(targetBranch!, templateLogo);
+                  } else {
+                    _setStatus('The template repository has no root logo.png; this project will use Flutter’s default icon unless you choose an icon.');
+                  }
+                }
+                final requestId = '${_projectId}-${DateTime.now().microsecondsSinceEpoch}';
                 final iconPath = hasCustomIcon
                     ? '.simple-app-builder/icons/${DateTime.now().millisecondsSinceEpoch}-${DateTime.now().microsecondsSinceEpoch}.png'
                     : '';
+                _updateProgress(9, const Duration(minutes: 3, seconds: 30), 'Saving this project’s Dart source archive in its private repository');
+                _setStatus('Saving the current Dart source archive to $targetRepository…');
+                await targetApi!.saveProjectSourceArchive(targetBranch!, archiveBytes);
                 final payloadSize = utf8.encode(jsonEncode({
                   'event_type': 'build_flutter_app',
                   'client_payload': {
                     'project_name': _name.text.trim(),
                     'package_name': _packageName.text.trim(),
-                    'source_archive_base64': sourceArchiveBase64,
                     'dependencies': _dependencies.text.trim(),
                     'has_custom_icon': hasCustomIcon,
                     'icon_path': iconPath,
                     'request_id': requestId,
                   },
                 })).length;
-                if (payloadSize > 60000) throw Exception('The GitHub event payload is too large after JSON encoding. Reduce the project source or dependency list.');
+                if (payloadSize > 60000) throw Exception('The GitHub event payload is too large after JSON encoding. Reduce project source size or dependency list.');
                 if (_iconBytes != null) {
-                  _setStatus('Uploading this project’s icon image…');
-                  await api.uploadProjectIcon(branch, iconPath, _iconBytes!);
+                  _updateProgress(10, const Duration(minutes: 3, seconds: 30), 'Uploading this project’s icon to its own repository');
+                  _setStatus('Uploading this project’s icon to $targetRepository…');
+                  await targetApi!.uploadProjectIcon(targetBranch!, iconPath, _iconBytes!);
                   cleanupIconPath = iconPath;
                 }
-                final previousRunNumber = await api.latestWorkflowRunNumber();
-                _setStatus('Sending ${_allDartFiles().length} Dart files to GitHub Actions…');
-                await api.dispatchBuild(
+
+                _updateProgress(12, const Duration(minutes: 3, seconds: 30), 'Sending the build request to GitHub Actions');
+                _setStatus('Sending build settings to $targetRepository; Dart files are already saved in its private repository…');
+                await targetApi!.dispatchBuild(
                   projectName: _name.text.trim(),
                   packageName: _packageName.text.trim(),
-                  sourceArchiveBase64: sourceArchiveBase64,
                   dependencies: _dependencies.text.trim(),
                   hasCustomIcon: hasCustomIcon,
                   iconPath: iconPath,
                   requestId: requestId,
                 );
-                final run = await api.waitForBuild(previousRunNumber, requestId, _setStatus);
+                final run = await targetApi!.waitForBuild(
+                  requestId,
+                  _setStatus,
+                  (run, percent, remaining, step) {
+                    final id = (run['id'] ?? '').toString();
+                    final url = (run['html_url'] ?? '').toString();
+                    if (mounted) setState(() {
+                      if (id.isNotEmpty) _lastRunId = id;
+                      if (url.startsWith('https://')) _lastRunUrl = url;
+                    });
+                    final adjustedPercent = 12 + (percent * 0.80).round();
+                    _updateProgress(adjustedPercent, remaining == null ? null : remaining + const Duration(seconds: 12), step);
+                  },
+                );
                 _lastRunId = (run['id'] ?? '').toString();
                 _lastRunUrl = (run['html_url'] ?? '').toString();
                 _githubBuildSucceeded = true;
-                _setStatus('GitHub reports success. Downloading the generated APK artifact…');
-                final zip = await api.downloadGeneratedApk(_lastRunId!);
+                _updateProgress(97, const Duration(seconds: 8), 'GitHub succeeded; retrieving the APK artifact');
+                _setStatus('GitHub reports success for $targetRepository. Downloading the generated APK artifact…');
+                final zip = await targetApi!.downloadGeneratedApk(_lastRunId!);
                 final archive = ZipDecoder().decodeBytes(zip);
                 ArchiveFile? apk;
                 for (final file in archive.files) {
@@ -1741,7 +2167,7 @@ jobs:
                 }
                 if (apk == null) {
                   final contents = archive.files.where((item) => item.isFile).map((item) => item.name).join(', ');
-                  throw Exception('GitHub artifact was downloaded but no APK was inside it. ZIP entries: ${contents.isEmpty ? '(none)' : contents}');
+                  throw Exception('GitHub succeeded but its artifact ZIP contains no APK. ZIP entries: ${contents.isEmpty ? '(none)' : contents}. Open GitHub run to inspect artifact publishing.');
                 }
                 final apkBytes = Uint8List.fromList(apk.content as List<int>);
                 if (apkBytes.length < 4 || apkBytes[0] != 0x50 || apkBytes[1] != 0x4b) throw Exception('The extracted .apk does not look like a valid APK archive.');
@@ -1755,26 +2181,32 @@ jobs:
                 if (!mounted) return;
                 setState(() {
                   _apkPath = outputPath;
-                  _status = 'Build succeeded in GitHub. APK is ready.\nSaved inside app storage: $outputPath\nUse Save APK to export it, Share APK to send it, or Install APK to open Android’s package installer.';
+                  _progressPercent = 100;
+                  _progressStep = 'APK downloaded and saved';
+                  _remainingEstimate = Duration.zero;
+                  _estimatedFinishAt = DateTime.now();
+                  _status = 'Build succeeded in GitHub. APK is ready.\nRepository: $targetRepository\nSaved inside app storage: $outputPath\nUse Save APK to export it, Share APK to send it, or Install APK to open Android’s package installer.';
                 });
                 _message('APK downloaded and ready. Choose Save, Share, or Install below.');
               } catch (error) {
                 String? automaticLogs;
                 if (error is WorkflowRunException) {
-                  _lastRunId = error.runId.isEmpty ? null : error.runId;
-                  _lastRunUrl = error.runUrl.isEmpty ? null : error.runUrl;
+                  _lastRunId = error.runId.isEmpty ? _lastRunId : error.runId;
+                  _lastRunUrl = error.runUrl.isEmpty ? _lastRunUrl : error.runUrl;
                   _githubBuildSucceeded = false;
                   if (_lastRunId != null) {
                     _setStatus('GitHub build failed. Fetching the run logs…');
                     try {
-                      automaticLogs = await widget.apiFactory().downloadWorkflowLogs(_lastRunId!);
+                      automaticLogs = await (targetApi ?? widget.apiFactory()).downloadWorkflowLogs(_lastRunId!);
                       if (automaticLogs.length > 9000) automaticLogs = '…(earlier log output omitted)…\n${automaticLogs.substring(automaticLogs.length - 9000)}';
                     } catch (logError) {
-                      automaticLogs = 'Automatic log retrieval also failed: $logError\nOpen the GitHub run using the button below.';
+                      automaticLogs = 'Automatic log retrieval also failed: $logError\nOpen the GitHub run to inspect it.';
                     }
                   }
                 }
                 if (mounted) {
+                  if (!_githubBuildSucceeded) { _updateProgress(_progressPercent, null, 'Build setup or GitHub Actions failed'); }
+                  else { _updateProgress(_progressPercent, null, 'GitHub succeeded; retrieving or saving the APK failed'); }
                   final detail = error.toString().replaceFirst(RegExp(r'^Exception: ?'), '');
                   final text = error is WorkflowRunException
                       ? 'GitHub build failed: ${error.message}\nRun: ${error.runUrl}\n${automaticLogs == null ? 'Use “Load build logs” below for step-by-step output.' : 'Automatic log excerpt:\n$automaticLogs'}'
@@ -1785,9 +2217,9 @@ jobs:
                 }
                 _message(_githubBuildSucceeded ? 'GitHub build succeeded, but the APK transfer failed.' : 'Build failed. Details and logs are available below when GitHub has a run ID.');
               } finally {
-                if (cleanupApi != null && cleanupBranch != null && cleanupIconPath != null && _lastRunId != null && _lastRunId!.isNotEmpty) {
+                if (targetApi != null && targetBranch != null && cleanupIconPath != null) {
                   try {
-                    await cleanupApi!.deleteProjectIcon(cleanupBranch!, cleanupIconPath!);
+                    await targetApi!.deleteProjectIcon(targetBranch!, cleanupIconPath!);
                   } catch (cleanupError) {
                     if (mounted) _setStatus('$_status\nNote: temporary icon cleanup failed: $cleanupError');
                   }
@@ -1929,6 +2361,19 @@ jobs:
                       TextField(controller: _name, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'My Company App')),
                       const SizedBox(height: 12),
                       TextField(controller: _packageName, autocorrect: false, decoration: const InputDecoration(labelText: 'Package name', hintText: 'com.company.myapp', helperText: 'Use lowercase reverse-DNS format with at least three segments.')),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _repositoryName,
+                        autocorrect: false,
+                        readOnly: _targetRepository.isNotEmpty,
+                        decoration: InputDecoration(
+                          labelText: 'Private GitHub repository name',
+                          hintText: 'my-flutter-app',
+                          helperText: _targetRepository.isNotEmpty
+                            ? 'This project reuses its private repository: $_targetRepository'
+                            : 'A new private repository will be created under the connected GitHub account. Rebuilds of this project reuse that repository.',
+                        ),
+                      ),
                     ]),
                   ),
                   Step(
@@ -2009,14 +2454,22 @@ jobs:
                     isActive: _step >= 3,
                     state: _status.startsWith('Build succeeded') ? StepState.complete : StepState.indexed,
                     content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      Text('Target repository: ${widget.repository.isEmpty ? '(not configured)' : widget.repository}'),
+                      Text('Builder workflow template: ${widget.repository.isEmpty ? '(not configured)' : normalizeRepository(widget.repository)}'),
+                      const SizedBox(height: 6),
+                      Text('This app’s private repository: ${_targetRepository.isEmpty ? _repositoryName.text.trim() + " (created on first build)" : _targetRepository}'),
                       const SizedBox(height: 8),
-                      Text('The workflow creates a fresh Flutter project and restores ${_additionalFiles.length + 1} Dart source files with their folder structure. It resolves dependencies detected in imports plus the packages listed above, applies the app icon, and builds a release APK. The builder APK is built during manual workflow runs; this request produces the separate APK for your project.'),
+                      Text('Each app gets its own private repository, so its logo and source cannot overwrite the Builder APK or another project. The latest Dart file tree is archived as .simple-app-builder/source.zip in that repository, and the APK build uses the same source. This project has ${_additionalFiles.length + 1} Dart source files.'),
                       const SizedBox(height: 8),
-                      const Text('Most builds take a few minutes; first builds or long dependency downloads can take longer. GitHub queue time also affects this.', style: TextStyle(fontSize: 12)),
-                      if (_status.isNotEmpty) ...[
+                      const Text('Progress and finish time are estimates based on GitHub Actions job steps and their observed durations. Queue time and package downloads can change the estimate.', style: TextStyle(fontSize: 12)),
+                      if (_building || _progressPercent > 0) ...[
                         const SizedBox(height: 16),
-                        if (_building) const LinearProgressIndicator(),
+                        LinearProgressIndicator(value: _progressPercent.clamp(0, 100) / 100),
+                        const SizedBox(height: 8),
+                        Text('$_progressPercent% · $_progressStep', style: Theme.of(context).textTheme.bodyMedium),
+                        if (_building) Text('Estimated remaining: ${_formatRemaining(_remainingEstimate)} · estimated finish: ${_formatFinish(_estimatedFinishAt)}', style: Theme.of(context).textTheme.bodySmall),
+                        const SizedBox(height: 8),
+                      ],
+                      if (_status.isNotEmpty) ...[
                         const SizedBox(height: 8),
                         SelectableText(_status),
                       ],
@@ -2089,22 +2542,24 @@ jobs:
             }
           }
           DART
-          # Keep the builder's own launcher icon sourced from repository-root ico.png.
-          # User-selected target-app icons are stored separately per build under .simple-app-builder/icons/.
-          if [[ -f "$GITHUB_WORKSPACE/ico.png" ]]; then
+          # Builder launcher assets come from the template repository's root logo.png.
+          # The monochrome alpha mask enables Android 13+ themed icons; the system chooses tint.
+          if [[ -f "$GITHUB_WORKSPACE/logo.png" ]]; then
             sudo apt-get update -qq
-            sudo apt-get install -y imagemagick
-            mkdir -p "$BUILDER_DIR/assets"
-            convert "$GITHUB_WORKSPACE/ico.png" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$BUILDER_DIR/assets/simple_app_builder_ico.png"
-            flutter pub add --dev flutter_launcher_icons
+            sudo apt-get install -y python3-pil
+            python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets"
+            flutter pub add --dev flutter_launcher_icons:^0.14.4
             cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
-            image_path: "assets/simple_app_builder_ico.png"
+            image_path: "assets/app_icon.png"
             adaptive_icon_background: "#FFFFFF"
-            adaptive_icon_foreground: "assets/simple_app_builder_ico.png"
+            adaptive_icon_foreground: "assets/app_icon_foreground.png"
+            adaptive_icon_monochrome: "assets/app_icon_monochrome.png"
           ICONCONFIG
             dart run flutter_launcher_icons
+          else
+            echo "::warning::logo.png was not found at the repository root; using Flutter's default launcher icon."
           fi
           flutter pub get
           flutter build apk --release --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
@@ -2132,6 +2587,7 @@ jobs:
           PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
           DART_CODE: ${{ github.event.client_payload.dart_code }}
           SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
+          SOURCE_ARCHIVE_PATH: ${{ github.workspace }}/.simple-app-builder/source.zip
           DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
           ICON_PATH: ${{ github.event.client_payload.icon_path }}
         run: |
@@ -2141,23 +2597,25 @@ jobs:
           APP_SLUG="${PACKAGE_NAME##*.}"
           flutter create --org "$ORG" --project-name "$APP_SLUG" "$TARGET_DIR"
 
-          # An archive lets the mobile app send many separate Dart files/folders in one
-          # workflow input. Only safe .dart files under lib/ are restored; zip-slip and
-          # unexpectedly large archives are rejected before any file is written.
+          # The builder commits its source ZIP to this repository before dispatching the
+          # event. Reading it from checkout avoids duplicating large source in GitHub's
+          # 64 KB repository_dispatch payload. Legacy inline archive payloads remain supported.
+          # Only safe Dart files under lib/ are restored; zip-slip and oversized archives fail clearly.
           python3 - "$TARGET_DIR" <<'PYFILES'
           import base64, io, os, re, shutil, sys, zipfile
           from pathlib import Path, PurePosixPath
 
           target = Path(sys.argv[1]).resolve()
           bundle = os.environ.get('SOURCE_ARCHIVE_B64', '').strip()
+          archive_path = Path(os.environ.get('SOURCE_ARCHIVE_PATH', '.simple-app-builder/source.zip'))
           legacy_source = os.environ.get('DART_CODE', '')
           lib_dir = target / 'lib'
           shutil.rmtree(lib_dir, ignore_errors=True)
           lib_dir.mkdir(parents=True, exist_ok=True)
 
-          if bundle:
+          if bundle or archive_path.is_file():
               try:
-                  zipped = base64.b64decode(bundle, validate=True)
+                  zipped = base64.b64decode(bundle, validate=True) if bundle else archive_path.read_bytes()
                   if len(zipped) > 5 * 1024 * 1024:
                       raise ValueError('compressed archive exceeds 5 MB')
                   with zipfile.ZipFile(io.BytesIO(zipped)) as archive:
@@ -2186,7 +2644,7 @@ jobs:
                           destination.parent.mkdir(parents=True, exist_ok=True)
                           destination.write_bytes(archive.read(info))
               except (ValueError, zipfile.BadZipFile, OSError) as exc:
-                  raise SystemExit(f'Could not restore source_archive_base64: {exc}')
+                  raise SystemExit(f'Could not restore Dart source archive: {exc}')
           else:
               if not legacy_source.strip():
                   raise SystemExit('No source archive or legacy dart_code was provided.')
@@ -2231,7 +2689,7 @@ jobs:
           fi
           flutter pub get
 
-      - name: Apply selected image or repository ico.png to all Android launcher icon variants
+      - name: Apply selected image or repository logo.png to Android launcher icons
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
@@ -2251,30 +2709,29 @@ jobs:
               echo "ERROR: A custom icon was requested, but $ICON_PATH is missing from the checked-out repository." >&2
               exit 1
             fi
-          elif [[ -f "$GITHUB_WORKSPACE/ico.png" ]]; then
-            ICON_SOURCE="$GITHUB_WORKSPACE/ico.png"
-            echo 'No project-specific icon was selected; using repository-root ico.png as the fallback.'
+          elif [[ -f "$GITHUB_WORKSPACE/logo.png" ]]; then
+            ICON_SOURCE="$GITHUB_WORKSPACE/logo.png"
+            echo 'No project-specific icon was selected; using repository-root logo.png as the fallback.'
           else
-            echo 'No project icon was selected and no root ico.png exists; keeping Flutter launcher icons.'
+            echo 'No project-specific icon and no logo.png fallback were found; keeping Flutter launcher icons.'
             exit 0
           fi
           sudo apt-get update -qq
-          sudo apt-get install -y imagemagick
+          sudo apt-get install -y python3-pil
           mkdir -p "$TARGET_DIR/assets"
-          # Normalize PNG/JPEG/WebP/etc. from the chosen device image into a true PNG.
-          # A white square canvas avoids clipping wide/tall images on Android adaptive-icon masks.
-          convert "$ICON_SOURCE" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$TARGET_DIR/assets/simple_app_builder_ico.png"
+          python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets"
           cd "$TARGET_DIR"
-          flutter pub add --dev flutter_launcher_icons
+          flutter pub add --dev flutter_launcher_icons:^0.14.4
           cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
-            image_path: "assets/simple_app_builder_ico.png"
+            image_path: "assets/app_icon.png"
             adaptive_icon_background: "#FFFFFF"
-            adaptive_icon_foreground: "assets/simple_app_builder_ico.png"
+            adaptive_icon_foreground: "assets/app_icon_foreground.png"
+            adaptive_icon_monochrome: "assets/app_icon_monochrome.png"
           ICONCONFIG
           dart run flutter_launcher_icons
-          echo 'Applied the selected image to regular, round, and adaptive Android launcher icons.'
+          echo 'Applied color, adaptive, round, and Android 13+ monochrome themed launcher icons.'
 
       - name: Build generated release APK
         if: ${{ github.event_name == 'repository_dispatch' }}
