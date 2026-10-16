@@ -72,7 +72,9 @@ jobs:
         with:
           distribution: zulu
           java-version: '17'
-          cache: gradle
+          # Do not enable setup-java's Gradle cache here: this repository may only
+          # contain the workflow, while Flutter/Gradle projects are generated later
+          # under RUNNER_TEMP. setup-java cache discovery would fail before that.
 
       - name: Set up Flutter stable
         uses: subosito/flutter-action@v2
