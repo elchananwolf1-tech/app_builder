@@ -146,19 +146,21 @@ jobs:
           BUILDER_PACKAGE="${BUILDER_ORG}.simple_app_builder"
           flutter create --org "$BUILDER_ORG" --project-name simple_app_builder "$BUILDER_DIR"
           cd "$BUILDER_DIR"
-          # Pin APIs that match this embedded source. dynamic_color 1.8.1 uses Flutter's
-          # Material ColorScheme types. file_picker 12.3.0 uses static FilePicker.pickFile/
-          # saveFile methods and win32 6.x, compatible with flutter_secure_storage 11.x.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider share_plus open_filex cross_file
-          flutter pub add dynamic_color:1.8.1 file_picker:12.3.0
+          # Pin package generations to the APIs used by the embedded app. file_picker 12.3.0
+          # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
+          # selected above supplies the current compatible SDK. cross_file 0.3.x is required
+          # by both plugins; do not let Pub select the incompatible 0.4.x line.
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
           pubspec = Path('pubspec.yaml')
           text = pubspec.read_text(encoding='utf-8')
           replacements = {
-              'dynamic_color': '1.8.1',
-              'file_picker': '12.3.0',
+              'dynamic_color': '^1.8.1',
+              'file_picker': '^12.3.0',
+              'share_plus': '^13.3.1',
+              'cross_file': '^0.3.5+4',
           }
           for package, version in replacements.items():
               pattern = rf'(?m)^  {re.escape(package)}:\s*.*$'
