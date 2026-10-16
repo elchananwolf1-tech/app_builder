@@ -64,12 +64,17 @@ jobs:
               sys.exit('project_name must be 1–60 characters and contain no control characters.')
           if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}', package):
               sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
-          if not bundle and not source.strip():
-              sys.exit('Provide source_archive_base64 (recommended multi-file project) or dart_code (legacy single-file mode).')
+          # Empty source means this run is only provisioning the Simple App Builder APK.
+          # The mobile app dispatches a second run with a Dart source archive after the
+          # user creates a project, chooses its icon, and supplies code in the app.
+          if bundle and source.strip():
+              sys.exit('Provide either source_archive_base64 or dart_code, not both.')
           if bundle and (len(bundle) > 55000 or not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle)):
               sys.exit('source_archive_base64 is invalid or too large. Repack a smaller project; the compressed payload must be at most 55,000 characters.')
           if len(source.encode('utf-8')) > 50000:
               sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
+          if not bundle and not source.strip():
+              print('No app source supplied: this is a builder-only installation run; generated-app build steps will be skipped.')
           for dep in re.split(r'[,;\s]+', deps.strip()):
               if dep and not re.fullmatch(r'[a-z][a-z0-9_]*', dep):
                   sys.exit(f'Invalid dependency package name: {dep!r}. Use comma-separated pub.dev package names only.')
@@ -1706,6 +1711,7 @@ jobs:
 
       # Build the target project from the multi-file source archive after the builder artifact is safe.
       - name: Create the requested Flutter project and restore its Dart file tree
+        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
         shell: bash
         env:
           PROJECT_NAME: ${{ inputs.project_name }}
@@ -1811,6 +1817,7 @@ jobs:
           flutter pub get
 
       - name: Apply root icon.png as Android launcher icons
+        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1841,6 +1848,7 @@ jobs:
           fi
 
       - name: Build generated release APK
+        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1850,6 +1858,7 @@ jobs:
           cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.apk"
 
       - name: Upload generated release APK
+        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-apk-${{ steps.metadata.outputs.slug }}
