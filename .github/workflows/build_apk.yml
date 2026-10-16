@@ -1,6 +1,6 @@
 name: Build Simple App Builder or a Flutter project
 
-# The manual GitHub Actions run installs/builds only the builder APK.
+# The manual GitHub Actions run installs/builds only the builder APK; app requests build APK, AAB, or a Flutter Web preview.
 # A project created inside the app triggers repository_dispatch with a per-build payload.
 run-name: ${{ github.event.client_payload.request_id || 'Build Simple App Builder' }}
 on:
@@ -15,7 +15,7 @@ permissions:
 # sends authenticated REST API requests directly to GitHub to dispatch this job.
 jobs:
   build:
-    name: Generate app builder and requested Flutter APK
+    name: Generate app builder and requested Flutter output
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -36,6 +36,8 @@ jobs:
           REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
           ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
           DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
+          BUILD_FORMAT: ${{ github.event.client_payload.build_format }}
+          SIGN_RELEASE: ${{ github.event.client_payload.sign_release }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -70,6 +72,11 @@ jobs:
               sys.exit('remove_background must be true or false.')
           if (os.environ.get('DYNAMIC_THEMED_ICON', '').lower() or 'true') not in ('true', 'false'):
               sys.exit('dynamic_themed_icon must be true or false.')
+          output_format = (os.environ.get('BUILD_FORMAT', '').strip().lower() or 'apk')
+          if output_format not in ('apk', 'aab', 'web_preview'):
+              sys.exit('build_format must be apk, aab, or web_preview.')
+          if (os.environ.get('SIGN_RELEASE', '').strip().lower() or 'false') not in ('true', 'false'):
+              sys.exit('sign_release must be true or false.')
           if len(source.encode('utf-8')) > 50000:
               sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
           for dep in re.split(r'[,;\s]+', deps.strip()):
@@ -99,12 +106,61 @@ jobs:
           # contain the workflow, while Flutter/Gradle projects are generated later
           # under RUNNER_TEMP. setup-java cache discovery would fail before that.
 
-      - name: Set up Flutter stable
+      - name: Set up pinned Flutter stable SDK
         uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.47.7
           cache: true
           pub-cache: true
+
+      # Derive a reusable Gradle-cache key from the template, project archive, and
+      # manually supplied package list. This avoids creating a brand-new large cache
+      # for every single run while still refreshing when project/dependency inputs change.
+      - name: Compute Gradle cache key
+        id: gradle-cache-key
+        shell: bash
+        env:
+          EXTRA_DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
+        run: |
+          set -euo pipefail
+          # Key Gradle cache by the actual imported pub package names, not the full
+          # source ZIP. This avoids a cache miss for every code edit while refreshing
+          # the key when an auto-detected or manually requested package changes.
+          python3 - "$GITHUB_WORKSPACE/.simple-app-builder/source.zip" "$EXTRA_DEPENDENCIES" "$GITHUB_WORKSPACE/.github/workflows/build_apk.yml" >> "$GITHUB_OUTPUT" <<'PYCACHE'
+          import hashlib, re, sys, zipfile
+          from pathlib import Path
+          archive_path = Path(sys.argv[1])
+          explicit = sys.argv[2]
+          workflow_path = Path(sys.argv[3])
+          packages = set(item for item in re.split(r'[,;\s]+', explicit.strip()) if item)
+          if archive_path.is_file():
+              try:
+                  with zipfile.ZipFile(archive_path) as zf:
+                      for entry in zf.infolist():
+                          if entry.is_dir() or not entry.filename.startswith('lib/') or not entry.filename.endswith('.dart') or entry.file_size > 1024 * 1024:
+                              continue
+                          source = zf.read(entry).decode('utf-8', errors='ignore')
+                          packages.update(re.findall(r"package:([A-Za-z][A-Za-z0-9_]*)/", source))
+              except (OSError, zipfile.BadZipFile):
+                  print('::warning::Could not inspect source ZIP while computing cache key; using explicit dependency names only.', file=sys.stderr)
+          packages.difference_update({'flutter', 'flutter_test', 'integration_test'})
+          workflow_digest = hashlib.sha256(workflow_path.read_bytes()).hexdigest()
+          material = 'flutter-3.47.7-gradle-cache-v5\n' + workflow_digest + '\n' + '\n'.join(sorted(packages))
+          print('hash=' + hashlib.sha256(material.encode()).hexdigest())
+          PYCACHE
+
+      # Cache Gradle distributions and downloaded Android/Gradle dependencies.
+      # Flutter SDK and Pub package caches are handled by subosito/flutter-action above.
+      - name: Restore Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-v5-${{ steps.gradle-cache-key.outputs.hash }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-v5-
 
       # Helper applies consistent Android metadata and internet permission. New Flutter
       # templates use build.gradle.kts; the fallback handles older Groovy templates.
@@ -119,6 +175,7 @@ jobs:
           project = Path(sys.argv[1])
           app_label = sys.argv[2]
           application_id = sys.argv[3]
+          allow_local_preview = len(sys.argv) > 4 and sys.argv[4].lower() == 'true'
           manifest = project / 'android/app/src/main/AndroidManifest.xml'
           android_ns = 'http://schemas.android.com/apk/res/android'
           ET.register_namespace('android', android_ns)
@@ -128,12 +185,29 @@ jobs:
           if app is None:
               raise SystemExit(f'No <application> element in {manifest}')
           app.set(f'{{{android_ns}}}label', app_label)
+          if allow_local_preview:
+              app.set(f'{{{android_ns}}}usesCleartextTraffic', 'true')
           internet = f'{{{android_ns}}}name'
           if not any(node.tag == 'uses-permission' and node.get(internet) == 'android.permission.INTERNET' for node in root):
               permission = ET.Element('uses-permission')
               permission.set(internet, 'android.permission.INTERNET')
               root.insert(0, permission)
           tree.write(manifest, encoding='utf-8', xml_declaration=True)
+
+          # AGP 9 enables built-in Kotlin and its new DSL by default. Many current
+          # Flutter plugins still apply `kotlin-android` and use the legacy DSL.
+          # Opt into the compatibility path while the generated app and dependencies
+          # are not all migrated. This is idempotent and can be removed once the
+          # selected Flutter/plugin set is fully AGP-9 compatible.
+          properties = project / 'android/gradle.properties'
+          properties.parent.mkdir(parents=True, exist_ok=True)
+          prop_text = properties.read_text(encoding='utf-8') if properties.exists() else ''
+          for key, value in (('android.builtInKotlin', 'false'), ('android.newDsl', 'false'), ('org.gradle.caching', 'true'), ('org.gradle.parallel', 'true'), ('org.gradle.workers.max', '4'), ('org.gradle.jvmargs', '-Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -Dfile.encoding=UTF-8')):
+              if re.search(rf'(?m)^\s*{re.escape(key)}\s*=', prop_text):
+                  prop_text = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=.*$', f'{key}={value}', prop_text)
+              else:
+                  prop_text += f'\n{key}={value}\n'
+          properties.write_text(prop_text.lstrip('\n'), encoding='utf-8')
 
           gradle_files = [project / 'android/app/build.gradle.kts', project / 'android/app/build.gradle']
           gradle = next((p for p in gradle_files if p.exists()), None)
@@ -146,6 +220,107 @@ jobs:
           data = data.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 23')
           gradle.write_text(data, encoding='utf-8')
           PY
+          cat > "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" <<'PYPLUGIN'
+          import re, sys
+          from pathlib import Path
+
+          project_root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
+          def detect_agp_version():
+              if project_root is None:
+                  return None
+              candidates = [
+                  project_root / 'android/settings.gradle.kts',
+                  project_root / 'android/settings.gradle',
+                  project_root / 'android/build.gradle.kts',
+                  project_root / 'android/build.gradle',
+              ]
+              for candidate in candidates:
+                  if not candidate.is_file():
+                      continue
+                  source = candidate.read_text(encoding='utf-8')
+                  match = re.search(r'id\s*\(?\s*["\']com\.android\.application["\']\s*\)?\s*version\s*["\']([^"\']+)', source)
+                  if match:
+                      return match.group(1)
+                  match = re.search(r'com\.android\.tools\.build:gradle:([0-9][A-Za-z0-9_.-]*)', source)
+                  if match:
+                      return match.group(1)
+              return None
+
+          agp_version = detect_agp_version()
+          cache = Path.home() / '.pub-cache' / 'hosted' / 'pub.dev'
+          patched = []
+          inspected = 0
+          if cache.exists():
+              for package_dir in cache.glob('*'):
+                  android_dir = package_dir / 'android'
+                  for gradle in (android_dir / 'build.gradle', android_dir / 'build.gradle.kts'):
+                      if not gradle.is_file():
+                          continue
+                      text = gradle.read_text(encoding='utf-8')
+                      if not re.search(r'kotlin-android|org\.jetbrains\.kotlin\.android', text):
+                          continue
+                      inspected += 1
+                      original = text
+                      is_kts = gradle.suffix == '.kts'
+                      plugin_block = re.search(r'(?ms)(plugins\s*\{)(.*?)(\})', text)
+                      android_plugin = re.compile(r'(?m)^\s*id\s*\(?\s*["\']com\.android\.(?:library|application)["\']') if is_kts else re.compile(r'(?m)^\s*id\s+["\']com\.android\.(?:library|application)["\']')
+                      kotlin_plugin = re.compile(r'(?m)^\s*id\s*\(?\s*["\'](?:kotlin-android|org\.jetbrains\.kotlin\.android)["\']') if is_kts else re.compile(r'(?m)^\s*id\s+["\'](?:kotlin-android|org\.jetbrains\.kotlin\.android)["\']')
+                      if plugin_block:
+                          body = plugin_block.group(2)
+                          lines = body.strip('\n').splitlines() if body.strip('\n') else []
+                          android_indexes = [i for i, line in enumerate(lines) if android_plugin.search(line)]
+                          kotlin_indexes = [i for i, line in enumerate(lines) if kotlin_plugin.search(line)]
+                          # If kotlin is declared in plugins{}, ensure a compatible Android plugin
+                          # is declared before it. Preserve any existing Android plugin/version line.
+                          if kotlin_indexes and (not android_indexes or min(android_indexes) > min(kotlin_indexes)):
+                              kotlin_index = min(kotlin_indexes)
+                              if android_indexes:
+                                  android_index = min(android_indexes)
+                                  android_line = lines.pop(android_index).strip()
+                                  if android_index < kotlin_index:
+                                      kotlin_index -= 1
+                              else:
+                                  if agp_version:
+                                      android_line = f'id("com.android.library") version "{agp_version}"' if is_kts else f"id 'com.android.library' version '{agp_version}'"
+                                  else:
+                                      android_line = 'id("com.android.library")' if is_kts else "id 'com.android.library'"
+                              kotlin_indexes = [i for i, line in enumerate(lines) if kotlin_plugin.search(line)]
+                              kotlin_index = min(kotlin_indexes)
+                              indent_match = re.match(r'^\s*', lines[kotlin_index])
+                              indent = indent_match.group(0) if indent_match else '    '
+                              lines.insert(kotlin_index, indent + android_line)
+                              normalized_body = '\n' + '\n'.join(lines) + '\n'
+                              text = text[:plugin_block.start(2)] + normalized_body + text[plugin_block.end(2):]
+                      # Legacy `apply plugin` files, and mixed plugins{} + imperative application.
+                      kapply_pattern = re.compile(r'(?m)^\s*apply\s*\(\s*plugin\s*=\s*["\'](?:kotlin-android|org\.jetbrains\.kotlin\.android)["\']\s*\)') if is_kts else re.compile(r'(?m)^\s*apply\s+plugin\s*:\s*["\'](?:kotlin-android|org\.jetbrains\.kotlin\.android)["\']')
+                      aapply_pattern = re.compile(r'(?m)^\s*apply\s*\(\s*plugin\s*=\s*["\']com\.android\.(?:library|application)["\']\s*\)') if is_kts else re.compile(r'(?m)^\s*apply\s+plugin\s*:\s*["\']com\.android\.(?:library|application)["\']')
+                      kotlin_apply = kapply_pattern.search(text)
+                      if kotlin_apply:
+                          android_before = aapply_pattern.search(text[:kotlin_apply.start()])
+                          if not android_before:
+                              android_line = 'apply(plugin = "com.android.library")' if is_kts else "apply plugin: 'com.android.library'"
+                              # Put the Android plugin before Kotlin. If a plugins{} block exists,
+                              # it is executed first, so use it when the Kotlin apply is outside it.
+                              block = re.search(r'(?ms)(plugins\s*\{)(.*?)(\})', text)
+                              if block and not kotlin_plugin.search(block.group(2)):
+                                  if not android_plugin.search(block.group(2)):
+                                      new_body = block.group(2)
+                                      lines = new_body.strip('\n').splitlines() if new_body.strip('\n') else []
+                                      lines.append(('    ' + ('id("com.android.library")' if is_kts else "id 'com.android.library'")))
+                                      rebuilt = '\n' + '\n'.join(lines) + '\n'
+                                      text = text[:block.start(2)] + rebuilt + text[block.end(2):]
+                                  # If Android is already applied in plugins{}, its application
+                                  # precedes imperative `apply plugin: kotlin-android` automatically.
+                              else:
+                                  kotlin_apply = kapply_pattern.search(text)
+                                  text = text[:kotlin_apply.start()] + android_line + '\n' + text[kotlin_apply.start():]
+                      if text != original:
+                          gradle.write_text(text, encoding='utf-8')
+                          patched.append(str(gradle))
+          print(f'Kotlin/AGP compatibility preflight inspected {inspected} Kotlin-enabled Flutter plugin Gradle file(s).')
+          print('Adjusted missing/out-of-order Android plugin configuration in: ' + (', '.join(patched) if patched else '(no adjustment needed)'))
+          PYPLUGIN
+
           cat > "$RUNNER_TEMP/prepare_launcher_icons.py" <<'PYICON'
           import math, re, sys
           from pathlib import Path
@@ -160,6 +335,7 @@ jobs:
               raise SystemExit('Background color must be a six-digit hex color such as #FFFFFF.')
           target = tuple(int(background_hex[i:i+2], 16) for i in (1, 3, 5))
           output_dir.mkdir(parents=True, exist_ok=True)
+          Image.new('RGBA', (1024, 1024), (0, 0, 0, 0)).save(output_dir / 'app_icon_background.png', format='PNG', optimize=True)
 
           try:
               with Image.open(source_path) as opened:
@@ -169,6 +345,19 @@ jobs:
           if image.width < 1 or image.height < 1 or image.width * image.height > 40000000:
               raise SystemExit(f'Unsupported launcher image dimensions {image.width}x{image.height}; maximum is 40 megapixels.')
           image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+
+          def fit_artwork(source, max_size=768):
+              # thumbnail() only shrinks. Once a uniform background is cropped from a
+              # small logo, explicitly scale it up to fill a useful portion of the
+              # 1024px launcher canvas without changing its aspect ratio.
+              width, height = source.size
+              if width < 1 or height < 1:
+                  raise SystemExit('The cropped logo has no visible dimensions.')
+              scale = min(max_size / width, max_size / height)
+              new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+              if new_size == source.size:
+                  return source
+              return source.resize(new_size, Image.Resampling.LANCZOS)
 
           def remove_color_background(source, rgb, tolerance=28, feather=48):
               result = source.copy()
@@ -204,8 +393,7 @@ jobs:
               color_bbox = color_source.getchannel('A').getbbox()
           if color_bbox is None:
               raise SystemExit('The selected image is fully transparent. Choose a different logo image.')
-          color_source = color_source.crop(color_bbox)
-          color_source.thumbnail((768, 768), Image.Resampling.LANCZOS)
+          color_source = fit_artwork(color_source.crop(color_bbox), 768)
           color_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
           color_canvas.alpha_composite(color_source, ((1024-color_source.width)//2, (1024-color_source.height)//2))
           color_canvas.save(output_dir / 'app_icon.png', format='PNG', optimize=True)
@@ -228,8 +416,7 @@ jobs:
                   themed_bbox = themed_source.getchannel('A').getbbox()
               if themed_bbox is None:
                   raise SystemExit('The selected image is fully transparent; a themed icon cannot be generated.')
-              themed_source = themed_source.crop(themed_bbox)
-              themed_source.thumbnail((768, 768), Image.Resampling.LANCZOS)
+              themed_source = fit_artwork(themed_source.crop(themed_bbox), 768)
               themed_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
               alpha = themed_source.getchannel('A')
               white = Image.new('RGBA', themed_source.size, (255, 255, 255, 0))
@@ -254,7 +441,7 @@ jobs:
           # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
           # selected above supplies the current compatible SDK. cross_file 0.3.x is required
           # by both plugins; do not let Pub select the incompatible 0.4.x line.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0 webview_flutter:^4.13.0
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
@@ -274,7 +461,7 @@ jobs:
                   raise SystemExit(f'Could not pin {package} in pubspec.yaml')
           pubspec.write_text(text, encoding='utf-8')
           PYDEPS
-          python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE"
+          python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE" true
           cat > lib/main.dart <<'DART'
           import 'dart:async';
           import 'dart:convert';
@@ -301,6 +488,7 @@ jobs:
           import 'package:share_plus/share_plus.dart';
           import 'package:shared_preferences/shared_preferences.dart';
           import 'package:url_launcher/url_launcher.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
 
           const String compiledRepository = String.fromEnvironment(
             'BUILDER_REPOSITORY',
@@ -399,12 +587,15 @@ jobs:
               required this.packageName,
               required this.dartCode,
               this.additionalFiles = const {},
+              this.folders = const <String>{},
               this.dependencies = '',
               this.iconBase64,
               this.repository = '',
               this.removeBackground = true,
               this.iconBackgroundColor = '#FFFFFF',
               this.dynamicThemedIcon = true,
+              this.buildFormat = 'apk',
+              this.signRelease = false,
             });
 
             final String id;
@@ -414,29 +605,31 @@ jobs:
             final String dartCode;
             // Keys are full relative paths, such as lib/screens/home_screen.dart.
             final Map<String, String> additionalFiles;
-            // Explicit packages supplement packages discovered from Dart imports.
+            // Explicit folder structure; Flutter itself persists only folders containing files.
+            final Set<String> folders;
             final String dependencies;
             final String? iconBase64;
-            // Background removal applies to matching pixels across the entire image.
             final bool removeBackground;
-            // Android adaptive icon background color and color used for automatic cutout.
             final String iconBackgroundColor;
-            // Android 13+ launcher theme icon support, subject to launcher settings/support.
             final bool dynamicThemedIcon;
-            // Each app has an isolated, private GitHub repository for its source, icon, workflow and artifact.
             final String repository;
+            final String buildFormat;
+            final bool signRelease;
 
             AppProject copyWith({
               String? name,
               String? packageName,
               String? dartCode,
               Map<String, String>? additionalFiles,
+              Set<String>? folders,
               String? dependencies,
               String? iconBase64,
               String? repository,
               bool? removeBackground,
               String? iconBackgroundColor,
               bool? dynamicThemedIcon,
+              String? buildFormat,
+              bool? signRelease,
               bool clearIcon = false,
             }) => AppProject(
                   id: id,
@@ -444,12 +637,15 @@ jobs:
                   packageName: packageName ?? this.packageName,
                   dartCode: dartCode ?? this.dartCode,
                   additionalFiles: additionalFiles ?? this.additionalFiles,
+                  folders: folders ?? this.folders,
                   dependencies: dependencies ?? this.dependencies,
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
                   repository: repository ?? this.repository,
                   removeBackground: removeBackground ?? this.removeBackground,
                   iconBackgroundColor: iconBackgroundColor ?? this.iconBackgroundColor,
                   dynamicThemedIcon: dynamicThemedIcon ?? this.dynamicThemedIcon,
+                  buildFormat: buildFormat ?? this.buildFormat,
+                  signRelease: signRelease ?? this.signRelease,
                 );
 
             Map<String, dynamic> toJson() => {
@@ -458,12 +654,15 @@ jobs:
                   'packageName': packageName,
                   'dartCode': dartCode,
                   'additionalFiles': additionalFiles,
+                  'folders': folders.toList()..sort(),
                   'dependencies': dependencies,
                   'iconBase64': iconBase64,
                   'repository': repository,
                   'removeBackground': removeBackground,
                   'iconBackgroundColor': iconBackgroundColor,
                   'dynamicThemedIcon': dynamicThemedIcon,
+                  'buildFormat': buildFormat,
+                  'signRelease': signRelease,
                 };
 
             factory AppProject.fromJson(Map<String, dynamic> json) {
@@ -471,8 +670,20 @@ jobs:
               final rawFiles = json['additionalFiles'];
               if (rawFiles is Map) {
                 for (final entry in rawFiles.entries) {
-                  files[entry.key.toString()] = entry.value.toString();
+                  final path = entry.key.toString();
+                  if (_isSafeDartPath(path) && path != 'lib/main.dart') files[path] = entry.value.toString();
                 }
+              }
+              final folders = <String>{};
+              final rawFolders = json['folders'];
+              if (rawFolders is List) {
+                for (final folder in rawFolders) {
+                  final path = folder.toString();
+                  if (_isSafeFolderPath(path)) folders.add(path);
+                }
+              }
+              for (final path in files.keys) {
+                folders.addAll(_folderAncestors(path));
               }
               return AppProject(
                 id: (json['id'] ?? DateTime.now().microsecondsSinceEpoch).toString(),
@@ -480,12 +691,15 @@ jobs:
                 packageName: (json['packageName'] ?? 'com.example.myapp').toString(),
                 dartCode: (json['dartCode'] ?? '').toString(),
                 additionalFiles: files,
+                folders: folders,
                 dependencies: (json['dependencies'] ?? '').toString(),
                 iconBase64: json['iconBase64']?.toString(),
                 repository: (json['repository'] ?? '').toString(),
                 removeBackground: json['removeBackground'] is bool ? json['removeBackground'] as bool : true,
                 iconBackgroundColor: (json['iconBackgroundColor'] ?? '#FFFFFF').toString(),
                 dynamicThemedIcon: json['dynamicThemedIcon'] is bool ? json['dynamicThemedIcon'] as bool : true,
+                buildFormat: (json['buildFormat'] ?? 'apk').toString() == 'aab' ? 'aab' : 'apk',
+                signRelease: json['signRelease'] is bool ? json['signRelease'] as bool : false,
               );
             }
           }
@@ -601,6 +815,25 @@ jobs:
             if (!RegExp(r'^lib/[A-Za-z0-9_./-]+\.dart$').hasMatch(path)) return false;
             final segments = path.split('/');
             return !segments.any((part) => part.isEmpty || part == '.' || part == '..');
+          }
+
+          bool _isSafeFolderPath(String path) {
+            if (!path.startsWith('lib/') || path.contains('\\') || path.endsWith('/')) return false;
+            if (!RegExp(r'^lib/[A-Za-z0-9_./-]+$').hasMatch(path)) return false;
+            final segments = path.split('/');
+            return segments.length >= 2 && !segments.any((part) => part.isEmpty || part == '.' || part == '..');
+          }
+
+          Set<String> _folderAncestors(String path) {
+            final pieces = path.split('/');
+            if (pieces.length < 3) return <String>{};
+            final result = <String>{};
+            var current = pieces.first;
+            for (final piece in pieces.skip(1).take(pieces.length - 2)) {
+              current = '$current/$piece';
+              result.add(current);
+            }
+            return result;
           }
 
           String _widgetClassNameForPath(String path) {
@@ -735,6 +968,13 @@ jobs:
             Future<String> defaultBranch() async {
               final json = checkedJson(await request('GET', _repoPath));
               return (json['default_branch'] ?? 'main').toString();
+            }
+
+            Future<Set<String>> actionSecretNames() async {
+              final json = checkedJson(await request('GET', '$_repoPath/actions/secrets?per_page=100'));
+              final secrets = (json['secrets'] as List<dynamic>? ?? const <dynamic>[])
+                  .whereType<Map<String, dynamic>>();
+              return secrets.map((item) => (item['name'] ?? '').toString()).where((name) => name.isNotEmpty).toSet();
             }
 
             Future<Map<String, dynamic>> createPrivateRepository(String name, {String? description}) async {
@@ -882,6 +1122,8 @@ jobs:
               required String iconBackgroundColor,
               required bool dynamicThemedIcon,
               required String requestId,
+              String buildFormat = 'apk',
+              bool signRelease = false,
             }) async {
               // repository_dispatch keeps project fields out of GitHub's static
               // "Run workflow" form. The mobile app sends a different payload per build.
@@ -896,6 +1138,8 @@ jobs:
                   'remove_background': removeBackground,
                   'icon_background_color': iconBackgroundColor,
                   'dynamic_themed_icon': dynamicThemedIcon,
+                  'build_format': buildFormat,
+                  'sign_release': signRelease,
                   'request_id': requestId,
                 },
               });
@@ -915,8 +1159,10 @@ jobs:
               if (value.contains('patch helper')) return 2;
               if (value.contains('create the requested flutter project')) return 28;
               if (value.contains('apply selected image')) return 30;
-              if (value.contains('build generated release apk')) return 150;
+              if (value.contains('build requested output')) return 150;
               if (value.contains('upload generated release apk')) return 10;
+              if (value.contains('upload generated android app bundle')) return 10;
+              if (value.contains('upload generated flutter web preview')) return 10;
               if (value.contains('generate the real simple app builder')) return 120;
               if (value.contains('upload simple app builder')) return 8;
               return 25;
@@ -988,7 +1234,7 @@ jobs:
               void Function(Map<String, dynamic> run, int percent, Duration? remaining, String step) onProgress,
             ) async {
               final pollingStarted = DateTime.now();
-              for (var attempt = 0; attempt < 360; attempt++) {
+              for (var attempt = 0; attempt < 660; attempt++) {
                 await Future<void>.delayed(const Duration(seconds: 5));
                 final runsResponse = await request(
                   'GET',
@@ -1036,11 +1282,11 @@ jobs:
                     final url = (run['html_url'] ?? '').toString();
                     throw WorkflowRunException(message: 'GitHub Actions concluded the build as ${run['conclusion'] ?? 'failure'}. Open the run or load its logs below.', runId: runId, runUrl: url);
                   }
-                  onProgress(run, 97, const Duration(seconds: 8), 'Build finished; downloading APK artifact');
+                  onProgress(run, 97, const Duration(seconds: 8), 'Build finished; downloading the requested artifact');
                   return run;
                 }
               }
-              throw TimeoutException('Build did not finish within 30 minutes. Check the Actions tab in GitHub.');
+              throw TimeoutException('Build did not finish within 55 minutes. Check the Actions tab in GitHub.');
             }
 
             Future<Uint8List> _downloadZipEndpoint(String endpoint) async {
@@ -1100,18 +1346,28 @@ jobs:
               throw Exception('Could not download GitHub ZIP data: ${lastError ?? 'unknown download error'}');
             }
 
-            Future<Uint8List> downloadGeneratedApk(String runId) async {
+            Future<Uint8List> downloadGeneratedArtifact(String runId, String format) async {
+              final prefix = switch (format) {
+                'aab' => 'generated-aab-',
+                'web_preview' => 'generated-web-',
+                _ => 'generated-apk-',
+              };
+              final label = switch (format) {
+                'aab' => 'Android App Bundle',
+                'web_preview' => 'Flutter Web preview',
+                _ => 'APK',
+              };
               final json = checkedJson(await request('GET', '$_repoPath/actions/runs/$runId/artifacts?per_page=100'));
               final artifacts = (json['artifacts'] as List<dynamic>? ?? const []).whereType<Map<String, dynamic>>();
               final matching = artifacts.where((a) =>
-                (a['name'] ?? '').toString().startsWith('generated-apk-') && a['expired'] != true).toList();
+                (a['name'] ?? '').toString().startsWith(prefix) && a['expired'] != true).toList();
               if (matching.isEmpty) {
                 final names = artifacts.map((a) => (a['name'] ?? '(unnamed)').toString()).join(', ');
-                throw Exception('GitHub run succeeded but no generated APK artifact was attached. Artifacts reported by GitHub: ${names.isEmpty ? '(none)' : names}');
+                throw Exception('GitHub run succeeded but no $label artifact was attached. Artifacts reported by GitHub: ${names.isEmpty ? '(none)' : names}');
               }
               matching.sort((a, b) => ((b['created_at'] ?? '').toString()).compareTo((a['created_at'] ?? '').toString()));
               final artifactId = matching.first['id']?.toString();
-              if (artifactId == null || artifactId.isEmpty) throw Exception('GitHub listed the APK artifact without an artifact ID.');
+              if (artifactId == null || artifactId.isEmpty) throw Exception('GitHub listed the $label artifact without an artifact ID.');
               return _downloadZipEndpoint('$_repoPath/actions/artifacts/$artifactId/zip');
             }
 
@@ -1422,9 +1678,10 @@ jobs:
           }
 
           class _DashboardScreenState extends State<DashboardScreen> {
-            Future<void> _openWizard({AppProject? project}) async {
+            Future<void> _openWizard({AppProject? project, bool livePreview = false}) async {
               await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => ProjectWizard(
                 existing: project,
+                initialMode: livePreview ? 'web_preview' : null,
                 repository: widget.repository,
                 apiFactory: widget.apiFactory,
                 onSaveProject: (updated) async {
@@ -1508,12 +1765,14 @@ jobs:
                                   if (value == 'build') _openWizard(project: project);
                                   if (value == 'name') _rename(project);
                                   if (value == 'code') _editCode(project);
+                                  if (value == 'live') _openWizard(project: project, livePreview: true);
                                   if (value == 'delete') _delete(project);
                                 },
                                 itemBuilder: (_) => const [
                                   PopupMenuItem(value: 'build', child: ListTile(dense: true, leading: Icon(Icons.rocket_launch_outlined), title: Text('Build / manage'))),
                                   PopupMenuItem(value: 'name', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename'))),
                                   PopupMenuItem(value: 'code', child: ListTile(dense: true, leading: Icon(Icons.code), title: Text('Edit Dart source'))),
+                                  PopupMenuItem(value: 'live', child: ListTile(dense: true, leading: Icon(Icons.web), title: Text('Live App (Flutter Web)'))),
                                   PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete'))),
                                 ],
                               ),
@@ -1748,12 +2007,14 @@ jobs:
               required this.apiFactory,
               required this.onSaveProject,
               this.existing,
+              this.initialMode,
             });
 
             final String repository;
             final GitHubApi Function() apiFactory;
             final Future<void> Function(AppProject project) onSaveProject;
             final AppProject? existing;
+            final String? initialMode;
 
             @override
             State<ProjectWizard> createState() => _ProjectWizardState();
@@ -1768,7 +2029,10 @@ jobs:
             String _targetRepository = '';
             late String _dartCode;
             late Map<String, String> _additionalFiles;
+            late Set<String> _folders;
             String _selectedTemplate = 'Material 3 starter';
+            String _buildFormat = 'apk';
+            bool _signRelease = false;
             Uint8List? _iconBytes;
             Uint8List? _iconPreviewBytes;
             bool _removeBackground = true;
@@ -1810,6 +2074,18 @@ jobs:
                 _additionalFiles = Map<String, String>.from(widget.existing!.additionalFiles);
                 _selectedTemplate = 'Custom project';
               }
+              _folders = <String>{...?(widget.existing?.folders)};
+              for (final path in _additionalFiles.keys) {
+                _folders.addAll(_folderAncestors(path));
+              }
+              _buildFormat = widget.existing?.buildFormat == 'aab' ? 'aab' : 'apk';
+              _signRelease = widget.existing?.signRelease ?? false;
+              if (widget.initialMode == 'web_preview') {
+                _step = 3;
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) unawaited(_buildAndDownload(requestedFormat: 'web_preview'));
+                });
+              }
               if (widget.existing?.iconBase64 != null) {
                 try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
               }
@@ -1843,6 +2119,9 @@ jobs:
               removeBackground: _removeBackground,
               iconBackgroundColor: _iconBackgroundColor,
               dynamicThemedIcon: _dynamicThemedIcon,
+              folders: Set<String>.from(_folders),
+              buildFormat: _buildFormat,
+              signRelease: _signRelease,
             );
 
             Map<String, String> _allDartFiles() => <String, String>{
@@ -2028,6 +2307,7 @@ jobs:
                 setState(() {
                   _dartCode = imported.remove('lib/main.dart')!;
                   _additionalFiles = imported;
+                  _folders = <String>{...imported.keys.expand(_folderAncestors)};
                   _selectedTemplate = 'Custom project';
                 });
                 _message('Imported ${_additionalFiles.length + 1} Dart files. Other Flutter project files/assets are not copied by this Dart-source importer.');
@@ -2068,6 +2348,7 @@ jobs:
                 setState(() {
                   _dartCode = imported.remove('lib/main.dart')!;
                   _additionalFiles = imported;
+                  _folders = <String>{...imported.keys.expand(_folderAncestors)};
                   _selectedTemplate = 'Custom project';
                 });
                 _message('Imported ${_additionalFiles.length + 1} Dart files from ${picked.name}.');
@@ -2087,13 +2368,14 @@ jobs:
                   _dartCode = edited;
                 } else {
                   _additionalFiles[path] = edited;
+                  _folders.addAll(_folderAncestors(path));
                 }
                 _selectedTemplate = 'Custom project';
               });
             }
 
-            Future<void> _addDartFile() async {
-              final controller = TextEditingController(text: 'lib/screens/new_screen.dart');
+            Future<void> _addDartFile({String initialPath = 'lib/screens/new_screen.dart'}) async {
+              final controller = TextEditingController(text: initialPath);
               final path = await showDialog<String>(context: context, builder: (context) => AlertDialog(
                 title: const Text('Add Dart file'),
                 content: SizedBox(width: 440, child: TextField(
@@ -2123,6 +2405,7 @@ jobs:
               }
               final className = _widgetClassNameForPath(path);
               setState(() {
+                _folders.addAll(_folderAncestors(path));
                 _additionalFiles[path] = '''import 'package:flutter/material.dart';
 
           class $className extends StatelessWidget {
@@ -2150,6 +2433,69 @@ jobs:
               if (confirmed == true) setState(() => _additionalFiles.remove(path));
             }
 
+            Future<void> _createFolder({String initialPath = 'lib/models'}) async {
+              final controller = TextEditingController(text: initialPath);
+              final path = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+                title: const Text('Create folder'),
+                content: TextField(controller: controller, autofocus: true, autocorrect: false,
+                  decoration: const InputDecoration(labelText: 'Folder path', hintText: 'lib/models', helperText: 'Create folders under lib/. Use forward slashes.'),),
+                actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Create folder'))],
+              ));
+              controller.dispose();
+              if (path == null) return;
+              if (!_isSafeFolderPath(path)) { _message('Use a safe folder path such as lib/models or lib/screens/auth.'); return; }
+              if (_folders.contains(path)) { _message('That folder already exists.'); return; }
+              setState(() { _folders.addAll(_folderAncestors('$path/placeholder.dart')); _folders.add(path); });
+              _message('Folder created: $path');
+            }
+
+            Future<void> _renameFolder(String oldPath) async {
+              final controller = TextEditingController(text: oldPath);
+              final newPath = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+                title: const Text('Rename folder'),
+                content: TextField(controller: controller, autofocus: true, autocorrect: false, decoration: const InputDecoration(labelText: 'New folder path', hintText: 'lib/models/new_name')),
+                actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Rename'))],
+              ));
+              controller.dispose();
+              if (newPath == null || newPath == oldPath) return;
+              if (!_isSafeFolderPath(newPath) || newPath.startsWith('$oldPath/') || oldPath.startsWith('$newPath/')) { _message('Choose a valid destination folder outside the folder being renamed.'); return; }
+              final newConflicts = _folders.contains(newPath) || _folders.any((folder) => folder.startsWith('$newPath/')) || _additionalFiles.keys.any((file) => file.startsWith('$newPath/'));
+              if (newConflicts) { _message('The destination folder or a file in it already exists.'); return; }
+              setState(() {
+                final movedFiles = <String, String>{};
+                for (final entry in _additionalFiles.entries) {
+                  final key = entry.key.startsWith('$oldPath/') ? '$newPath${entry.key.substring(oldPath.length)}' : entry.key;
+                  movedFiles[key] = entry.value;
+                }
+                final movedFolders = <String>{};
+                for (final folder in _folders) {
+                  if (folder == oldPath || folder.startsWith('$oldPath/')) {
+                    movedFolders.add('$newPath${folder.substring(oldPath.length)}');
+                  } else {
+                    movedFolders.add(folder);
+                  }
+                }
+                movedFolders.addAll(_folderAncestors('$newPath/placeholder.dart'));
+                _additionalFiles = movedFiles;
+                _folders = movedFolders;
+                _selectedTemplate = 'Custom project';
+              });
+              _message('Folder renamed to $newPath. Imports in Dart files may need updating.');
+            }
+
+            Future<void> _deleteFolder(String path) async {
+              final confirmed = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+                title: const Text('Delete folder?'),
+                content: Text('Delete folder $path and all Dart files inside it? lib/main.dart is never deleted by this action.'),
+                actions: [TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Delete folder'))],
+              ));
+              if (confirmed != true) return;
+              setState(() {
+                _additionalFiles.removeWhere((file, _) => file.startsWith('$path/'));
+                _folders.removeWhere((folder) => folder == path || folder.startsWith('$path/'));
+              });
+            }
+
             Future<void> _applyTemplate() async {
               if (_selectedTemplate == 'Custom project') {
                 _message('Choose a starter template first.');
@@ -2168,6 +2514,7 @@ jobs:
               setState(() {
                 _dartCode = starter['lib/main.dart']!;
                 _additionalFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
+                _folders = <String>{..._additionalFiles.keys.expand(_folderAncestors)};
               });
             }
 
@@ -2224,7 +2571,13 @@ jobs:
               });
             }
 
-            Future<void> _buildAndDownload() async {
+            Future<void> _buildAndDownload({String? requestedFormat}) async {
+              final outputFormat = requestedFormat ?? _buildFormat;
+              final isPreview = outputFormat == 'web_preview';
+              if (_signRelease && !isPreview && normalizeRepository(_targetRepository).isEmpty) {
+                _message('Custom signing needs GitHub Actions secrets in the app’s private repository. First build this project with signing turned off so its private repository is created. Then add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD and ANDROID_KEY_ALIAS under Settings → Secrets and variables → Actions, and rebuild with signing enabled.');
+                return;
+              }
               if (!_validDetails() || !_validateFileTree()) return;
               if (widget.repository.isEmpty || !isValidRepository(widget.repository)) {
                 _message('The builder workflow template repository is not configured correctly. Open Settings and verify owner/repository.');
@@ -2268,6 +2621,19 @@ jobs:
                   _updateProgress(6, const Duration(minutes: 4), 'Reusing this app’s private repository');
                   targetApi = templateApi.forRepository(targetRepository);
                   targetBranch = await targetApi!.defaultBranch();
+                  if (_signRelease && !isPreview) {
+                    const requiredSigningSecrets = <String>{
+                      'ANDROID_KEYSTORE_BASE64',
+                      'ANDROID_KEYSTORE_PASSWORD',
+                      'ANDROID_KEY_PASSWORD',
+                      'ANDROID_KEY_ALIAS',
+                    };
+                    final presentSecrets = await targetApi!.actionSecretNames();
+                    final missingSecrets = requiredSigningSecrets.difference(presentSecrets).toList()..sort();
+                    if (missingSecrets.isNotEmpty) {
+                      throw Exception('Release signing is enabled, but these Actions secrets are missing from $targetRepository: ${missingSecrets.join(', ')}. Open Configure signing secrets on GitHub, add all four values, then retry. The build was not started.');
+                    }
+                  }
                   // Keep each target repo's workflow synced with the editable template in Settings.
                   _setStatus('Updating the app repository with the current workflow template…');
                   await targetApi!.saveWorkflow(targetBranch!, workflowSource);
@@ -2293,7 +2659,7 @@ jobs:
                 }
 
                 await widget.onSaveProject(_project(repository: targetRepository));
-                final hasCustomIcon = _iconBytes != null;
+                final hasCustomIcon = _iconBytes != null && !isPreview;
                 if (!hasCustomIcon) {
                   _updateProgress(8, const Duration(minutes: 4), 'Ensuring this app repository has a default logo');
                   final templateLogo = await templateApi.readRootLogo(templateBranch);
@@ -2321,11 +2687,13 @@ jobs:
                     'remove_background': _removeBackground,
                     'icon_background_color': _normaliseHex(_iconBackgroundColor),
                     'dynamic_themed_icon': _dynamicThemedIcon,
+                    'build_format': outputFormat,
+                    'sign_release': _signRelease && !isPreview,
                     'request_id': requestId,
                   },
                 })).length;
                 if (payloadSize > 60000) throw Exception('The GitHub event payload is too large after JSON encoding. Reduce project source size or dependency list.');
-                if (_iconBytes != null) {
+                if (hasCustomIcon) {
                   _updateProgress(10, const Duration(minutes: 3, seconds: 30), 'Uploading this project’s icon to its own repository');
                   _setStatus('Uploading this project’s icon to $targetRepository…');
                   await targetApi!.uploadProjectIcon(targetBranch!, iconPath, _iconBytes!);
@@ -2344,6 +2712,8 @@ jobs:
                   iconBackgroundColor: _iconBackgroundColor,
                   dynamicThemedIcon: _dynamicThemedIcon,
                   requestId: requestId,
+                  buildFormat: outputFormat,
+                  signRelease: _signRelease && !isPreview,
                 );
                 final run = await targetApi!.waitForBuild(
                   requestId,
@@ -2362,37 +2732,92 @@ jobs:
                 _lastRunId = (run['id'] ?? '').toString();
                 _lastRunUrl = (run['html_url'] ?? '').toString();
                 _githubBuildSucceeded = true;
-                _updateProgress(97, const Duration(seconds: 8), 'GitHub succeeded; retrieving the APK artifact');
-                _setStatus('GitHub reports success for $targetRepository. Downloading the generated APK artifact…');
-                final zip = await targetApi!.downloadGeneratedApk(_lastRunId!);
+                _updateProgress(97, const Duration(seconds: 8), 'GitHub succeeded; retrieving the ${isPreview ? 'Web preview' : outputFormat.toUpperCase()} artifact');
+                _setStatus('GitHub reports success for $targetRepository. Downloading the ${isPreview ? 'Flutter Web preview' : outputFormat.toUpperCase()} artifact…');
+                final zip = await targetApi!.downloadGeneratedArtifact(_lastRunId!, outputFormat);
                 final archive = ZipDecoder().decodeBytes(zip);
-                ArchiveFile? apk;
+                if (isPreview) {
+                  ArchiveFile? webZip;
+                  for (final file in archive.files) {
+                    if (file.isFile && file.name.toLowerCase().endsWith('.zip')) { webZip = file; break; }
+                  }
+                  if (webZip == null) {
+                    final contents = archive.files.where((item) => item.isFile).map((item) => item.name).join(', ');
+                    throw Exception('GitHub succeeded but the Web artifact ZIP did not contain a nested website ZIP. Entries: ${contents.isEmpty ? '(none)' : contents}.');
+                  }
+                  final webArchive = ZipDecoder().decodeBytes(Uint8List.fromList(webZip.content as List<int>));
+                  final docs = await getApplicationDocumentsDirectory();
+                  final previewDir = Directory('${docs.path}${Platform.pathSeparator}live_previews${Platform.pathSeparator}$_projectId-${DateTime.now().millisecondsSinceEpoch}');
+                  await previewDir.create(recursive: true);
+                  var totalBytes = 0;
+                  var fileCount = 0;
+                  var hasIndex = false;
+                  for (final entry in webArchive.files) {
+                    if (!entry.isFile) continue;
+                    final normalized = entry.name.replaceAll('\\', '/');
+                    final segments = normalized.split('/');
+                    if (normalized.startsWith('/') || segments.any((part) => part.isEmpty || part == '.' || part == '..')) {
+                      throw Exception('The Web preview archive contains an unsafe path: ${entry.name}');
+                    }
+                    totalBytes += entry.size;
+                    fileCount++;
+                    if (fileCount > 10000 || totalBytes > 250 * 1024 * 1024) {
+                      throw Exception('The Web preview is too large to open safely (limit: 10,000 files / 250 MB).');
+                    }
+                    final targetFile = File('${previewDir.path}${Platform.pathSeparator}${segments.join(Platform.pathSeparator)}');
+                    await targetFile.parent.create(recursive: true);
+                    await targetFile.writeAsBytes(entry.content as List<int>, flush: false);
+                    if (normalized == 'index.html') hasIndex = true;
+                  }
+                  if (!hasIndex) throw Exception('The Web preview did not contain index.html. The Flutter Web build may be incomplete.');
+                  _updateProgress(100, Duration.zero, 'Flutter Web preview ready');
+                  _setStatus('Web preview built successfully. This runs the Flutter Web version only; some native-only plugins may not work in a Web preview.');
+                  if (mounted) {
+                    await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => LivePreviewScreen(
+                      root: previewDir,
+                      title: '${_name.text.trim()} — Live App',
+                    )));
+                  }
+                  if (mounted) setState(() {
+                    _progressPercent = 100;
+                    _progressStep = 'Web preview opened';
+                    _remainingEstimate = Duration.zero;
+                    _estimatedFinishAt = DateTime.now();
+                    _status = 'Flutter Web preview built and opened. No APK/AAB was compiled in this run. Preview assets remain in this app’s private storage.';
+                  });
+                  return;
+                }
+
+                final expectedExtension = outputFormat == 'aab' ? '.aab' : '.apk';
+                ArchiveFile? generated;
                 for (final file in archive.files) {
-                  if (file.isFile && file.name.toLowerCase().endsWith('.apk')) { apk = file; break; }
+                  if (file.isFile && file.name.toLowerCase().endsWith(expectedExtension)) { generated = file; break; }
                 }
-                if (apk == null) {
+                if (generated == null) {
                   final contents = archive.files.where((item) => item.isFile).map((item) => item.name).join(', ');
-                  throw Exception('GitHub succeeded but its artifact ZIP contains no APK. ZIP entries: ${contents.isEmpty ? '(none)' : contents}. Open GitHub run to inspect artifact publishing.');
+                  throw Exception('GitHub succeeded but its artifact ZIP contains no ${expectedExtension.substring(1).toUpperCase()}. ZIP entries: ${contents.isEmpty ? '(none)' : contents}. Open the GitHub run to inspect artifact publishing.');
                 }
-                final apkBytes = Uint8List.fromList(apk.content as List<int>);
-                if (apkBytes.length < 4 || apkBytes[0] != 0x50 || apkBytes[1] != 0x4b) throw Exception('The extracted .apk does not look like a valid APK archive.');
+                final outputBytes = Uint8List.fromList(generated.content as List<int>);
+                if (outputBytes.length < 4 || outputBytes[0] != 0x50 || outputBytes[1] != 0x4b) {
+                  throw Exception('The extracted ${expectedExtension.substring(1).toUpperCase()} does not look like a valid ZIP-based Android artifact.');
+                }
                 final safeName = _name.text.trim().replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
                 final baseName = safeName.isEmpty ? 'generated_app' : safeName;
                 final docs = await getApplicationDocumentsDirectory();
-                final outputDir = Directory('${docs.path}${Platform.pathSeparator}generated_apks');
+                final outputDir = Directory('${docs.path}${Platform.pathSeparator}generated_outputs');
                 await outputDir.create(recursive: true);
-                final outputPath = '${outputDir.path}${Platform.pathSeparator}$baseName-${DateTime.now().millisecondsSinceEpoch}.apk';
-                await File(outputPath).writeAsBytes(apkBytes, flush: true);
+                final outputPath = '${outputDir.path}${Platform.pathSeparator}$baseName-${DateTime.now().millisecondsSinceEpoch}$expectedExtension';
+                await File(outputPath).writeAsBytes(outputBytes, flush: true);
                 if (!mounted) return;
                 setState(() {
                   _apkPath = outputPath;
                   _progressPercent = 100;
-                  _progressStep = 'APK downloaded and saved';
+                  _progressStep = '${outputFormat.toUpperCase()} downloaded and saved';
                   _remainingEstimate = Duration.zero;
                   _estimatedFinishAt = DateTime.now();
-                  _status = 'Build succeeded in GitHub. APK is ready.\nRepository: $targetRepository\nSaved inside app storage: $outputPath\nUse Save APK to export it, Share APK to send it, or Install APK to open Android’s package installer.';
+                  _status = 'Build succeeded in GitHub. ${outputFormat.toUpperCase()} is ready.\nRepository: $targetRepository\nSaved inside app storage: $outputPath\nUse Save or Share to export it.${outputFormat == 'apk' ? ' Use Install APK to open Android’s package installer.' : ' An AAB cannot be installed directly on the phone.'}${_signRelease ? '\nCustom release signing was requested.' : outputFormat == 'aab' ? '\nNote: a personal release/upload keystore was not configured by this project unless you set the signing secrets in its repository.' : ''}';
                 });
-                _message('APK downloaded and ready. Choose Save, Share, or Install below.');
+                _message('${outputFormat.toUpperCase()} downloaded and ready. Choose Save or Share below.');
               } catch (error) {
                 String? automaticLogs;
                 if (error is WorkflowRunException) {
@@ -2411,16 +2836,16 @@ jobs:
                 }
                 if (mounted) {
                   if (!_githubBuildSucceeded) { _updateProgress(_progressPercent, null, 'Build setup or GitHub Actions failed'); }
-                  else { _updateProgress(_progressPercent, null, 'GitHub succeeded; retrieving or saving the APK failed'); }
+                  else { _updateProgress(_progressPercent, null, 'GitHub succeeded; retrieving or saving the requested artifact failed'); }
                   final detail = error.toString().replaceFirst(RegExp(r'^Exception: ?'), '');
                   final text = error is WorkflowRunException
                       ? 'GitHub build failed: ${error.message}\nRun: ${error.runUrl}\n${automaticLogs == null ? 'Use “Load build logs” below for step-by-step output.' : 'Automatic log excerpt:\n$automaticLogs'}'
                       : _githubBuildSucceeded
-                          ? 'GitHub build SUCCEEDED, but retrieving or saving the APK failed: $detail\nThe build itself did not fail. Use “Load build logs” or open the successful run in GitHub.'
+                          ? 'GitHub build SUCCEEDED, but retrieving or saving ${outputFormat == 'web_preview' ? 'the Web preview' : outputFormat.toUpperCase()} failed: $detail\nThe build itself did not fail. Use “Load build logs” or open the successful run in GitHub.'
                           : 'Build could not complete: $detail${_lastRunUrl == null ? '' : '\nRun: $_lastRunUrl'}';
                   setState(() => _status = text);
                 }
-                _message(_githubBuildSucceeded ? 'GitHub build succeeded, but the APK transfer failed.' : 'Build failed. Details and logs are available below when GitHub has a run ID.');
+                _message(_githubBuildSucceeded ? 'GitHub build succeeded, but the requested artifact transfer failed.' : 'Build failed. Details and logs are available below when GitHub has a run ID.');
               } finally {
                 if (targetApi != null && targetBranch != null && cleanupIconPath != null) {
                   try {
@@ -2440,25 +2865,30 @@ jobs:
               }
             }
 
+            String get _outputExtension => _buildFormat == 'aab' ? 'aab' : 'apk';
+            String get _outputLabel => _outputExtension.toUpperCase();
+            String get _outputMime => _outputExtension == 'apk' ? 'application/vnd.android.package-archive' : 'application/octet-stream';
+
             Future<void> _saveApk() async {
               final path = _apkPath;
               if (path == null) return;
               try {
-                final name = '${_name.text.trim().replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-')}.apk';
+                final rawName = _name.text.trim().replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-');
+                final name = '${rawName.isEmpty ? 'generated_app' : rawName}.$_outputExtension';
                 final output = await FilePicker.saveFile(
-                  dialogTitle: 'Save APK to device or selected location',
+                  dialogTitle: 'Save $_outputLabel to device or selected location',
                   fileName: name,
-                  mimeType: 'application/vnd.android.package-archive',
+                  mimeType: _outputMime,
                   type: FileType.custom,
-                  allowedExtensions: const ['apk'],
+                  allowedExtensions: [_outputExtension],
                   bytes: await File(path).readAsBytes(),
                 );
-                if (output == null) { _message('Save was canceled. The APK is still kept in app storage.'); return; }
-                _setStatus('APK saved to: $output');
-                _message('APK saved successfully.');
+                if (output == null) { _message('Save was canceled. The $_outputLabel is still kept in app storage.'); return; }
+                _setStatus('$_outputLabel saved to: $output');
+                _message('$_outputLabel saved successfully.');
               } catch (error) {
-                _message('Could not save APK: $error');
-                _setStatus('APK remains in app storage at ${_apkPath ?? '(unknown path)'}. Save error: $error');
+                _message('Could not save $_outputLabel: $error');
+                _setStatus('$_outputLabel remains in app storage at ${_apkPath ?? '(unknown path)'}. Save error: $error');
               }
             }
 
@@ -2467,9 +2897,9 @@ jobs:
               if (path == null) return;
               try {
                 await SharePlus.instance.share(ShareParams(
-                  files: [XFile(path, mimeType: 'application/vnd.android.package-archive')],
-                  subject: '${_name.text.trim()} APK',
-                  text: 'Release APK for ${_name.text.trim()}.',
+                  files: [XFile(path, mimeType: _outputMime)],
+                  subject: '${_name.text.trim()} $_outputLabel',
+                  text: '${_outputLabel} for ${_name.text.trim()}.',
                 ));
               } catch (error) {
                 _message('Could not open the Android share sheet: $error');
@@ -2478,7 +2908,7 @@ jobs:
 
             Future<void> _installApk() async {
               final path = _apkPath;
-              if (path == null) return;
+              if (path == null || _buildFormat != 'apk') return;
               try {
                 final result = await OpenFilex.open(path);
                 _setStatus('APK installer result: ${result.message}. If Android asks, allow this app to install unknown apps and confirm installation.');
@@ -2551,7 +2981,7 @@ jobs:
                 controlsBuilder: (context, details) => Padding(
                   padding: const EdgeInsets.only(top: 16),
                   child: Row(children: [
-                    FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build and download APK') : 'Continue')),
+                    FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build ${_buildFormat.toUpperCase()}') : 'Continue')),
                     const SizedBox(width: 10),
                     if (!_building) TextButton(onPressed: details.onStepCancel, child: Text(_step == 0 ? 'Cancel' : 'Back')),
                   ]),
@@ -2668,10 +3098,38 @@ jobs:
                       )),
                       const SizedBox(height: 14),
                       Row(children: [
-                        Expanded(child: Text('Project file tree · ${_additionalFiles.length + 1} files', style: Theme.of(context).textTheme.titleMedium)),
-                        FilledButton.icon(onPressed: _building ? null : _addDartFile, icon: const Icon(Icons.create_new_folder_outlined), label: const Text('Add Dart file')),
+                        Expanded(child: Text('Project file tree · ${_folders.length} folders · ${_additionalFiles.length + 1} Dart files', style: Theme.of(context).textTheme.titleMedium)),
+                        PopupMenuButton<String>(
+                          tooltip: 'Create folder or file',
+                          onSelected: (value) { if (value == 'folder') _createFolder(); if (value == 'file') _addDartFile(); },
+                          itemBuilder: (_) => const [
+                            PopupMenuItem(value: 'folder', child: ListTile(dense: true, leading: Icon(Icons.create_new_folder_outlined), title: Text('Create folder'))),
+                            PopupMenuItem(value: 'file', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Add Dart file'))),
+                          ],
+                        ),
                       ]),
                       const SizedBox(height: 8),
+                      ...(_folders.toList()..sort()).map((folder) => Card(
+                        margin: const EdgeInsets.only(bottom: 6),
+                        child: ListTile(
+                          leading: const Icon(Icons.folder_outlined),
+                          title: Text(folder, maxLines: 1, overflow: TextOverflow.ellipsis),
+                          subtitle: Text('${_additionalFiles.keys.where((file) => file.startsWith('$folder/')).length} file(s) in this folder'),
+                          trailing: PopupMenuButton<String>(
+                            tooltip: 'Manage $folder',
+                            onSelected: (action) {
+                              if (action == 'add') _addDartFile(initialPath: '$folder/new_file.dart');
+                              if (action == 'rename') _renameFolder(folder);
+                              if (action == 'delete') _deleteFolder(folder);
+                            },
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: 'add', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Add Dart file here'))),
+                              PopupMenuItem(value: 'rename', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename folder'))),
+                              PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete folder and files'))),
+                            ],
+                          ),
+                        ),
+                      )),
                       _fileTile('lib/main.dart', isMain: true),
                       ..._sortedAdditionalPaths.map((path) => _fileTile(path, isMain: false)),
                       const SizedBox(height: 4),
@@ -2707,7 +3165,33 @@ jobs:
                       const SizedBox(height: 6),
                       Text('This app’s private repository: ${_targetRepository.isEmpty ? _repositoryName.text.trim() + " (created on first build)" : _targetRepository}'),
                       const SizedBox(height: 8),
-                      Text('Each app gets its own private repository, so its logo and source cannot overwrite the Builder APK or another project. The latest Dart file tree is archived as .simple-app-builder/source.zip in that repository, and the APK build uses the same source. This project has ${_additionalFiles.length + 1} Dart source files.'),
+                      Text('Each app gets its own private repository, so its logo and source cannot overwrite the Builder APK or another project. The latest Dart file tree is archived as .simple-app-builder/source.zip in that repository. This project has ${_additionalFiles.length + 1} Dart source files.'),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        value: _buildFormat,
+                        decoration: const InputDecoration(labelText: 'Build output'),
+                        items: const [
+                          DropdownMenuItem(value: 'apk', child: Text('APK · install directly on Android')),
+                          DropdownMenuItem(value: 'aab', child: Text('AAB · Android App Bundle for Play Console')),
+                        ],
+                        onChanged: _building ? null : (value) { if (value != null) setState(() => _buildFormat = value); },
+                      ),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _signRelease,
+                        title: const Text('Sign release with my own keystore (optional)'),
+                        subtitle: const Text('Requires ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD and ANDROID_KEY_ALIAS as GitHub Actions secrets in this project repository. Never put passwords in source code.'),
+                        onChanged: _building ? null : (value) => setState(() => _signRelease = value),
+                      ),
+                      if (_signRelease && _targetRepository.isNotEmpty)
+                        Align(alignment: Alignment.centerLeft, child: OutlinedButton.icon(
+                          onPressed: () => launchUrl(Uri.parse('https://github.com/${normalizeRepository(_targetRepository)}/settings/secrets/actions'), mode: LaunchMode.externalApplication),
+                          icon: const Icon(Icons.key_outlined), label: const Text('Configure signing secrets on GitHub'),
+                        )),
+                      if (_signRelease) const Padding(
+                        padding: EdgeInsets.only(bottom: 8),
+                        child: Text('Keep the same keystore for future updates. If you lose it, updates to the same published Android application may not be accepted.', style: TextStyle(fontSize: 12)),
+                      ),
                       const SizedBox(height: 8),
                       const Text('Progress and finish time are estimates based on GitHub Actions job steps and their observed durations. Queue time and package downloads can change the estimate.', style: TextStyle(fontSize: 12)),
                       if (_building || _progressPercent > 0) ...[
@@ -2724,12 +3208,12 @@ jobs:
                       ],
                       if (_apkPath != null) ...[
                         const SizedBox(height: 16),
-                        Text('APK ready', style: Theme.of(context).textTheme.titleMedium),
+                        Text('${_buildFormat.toUpperCase()} ready', style: Theme.of(context).textTheme.titleMedium),
                         const SizedBox(height: 8),
                         Wrap(spacing: 8, runSpacing: 8, children: [
-                          FilledButton.icon(onPressed: _building ? null : _saveApk, icon: const Icon(Icons.save_alt), label: const Text('Save APK')),
-                          OutlinedButton.icon(onPressed: _building ? null : _shareApk, icon: const Icon(Icons.share_outlined), label: const Text('Share APK')),
-                          OutlinedButton.icon(onPressed: _building ? null : _installApk, icon: const Icon(Icons.install_mobile), label: const Text('Install APK')),
+                          FilledButton.icon(onPressed: _building ? null : _saveApk, icon: const Icon(Icons.save_alt), label: Text('Save ${_buildFormat.toUpperCase()}')),
+                          OutlinedButton.icon(onPressed: _building ? null : _shareApk, icon: const Icon(Icons.share_outlined), label: Text('Share ${_buildFormat.toUpperCase()}')),
+                          if (_buildFormat == 'apk') OutlinedButton.icon(onPressed: _building ? null : _installApk, icon: const Icon(Icons.install_mobile), label: const Text('Install APK')),
                         ]),
                       ],
                       if (_lastRunId != null) ...[
@@ -2743,6 +3227,163 @@ jobs:
                   ),
                 ],
               ),
+            );
+          }
+
+          class LivePreviewScreen extends StatefulWidget {
+            const LivePreviewScreen({super.key, required this.root, required this.title});
+            final Directory root;
+            final String title;
+
+            @override
+            State<LivePreviewScreen> createState() => _LivePreviewScreenState();
+          }
+
+          class _LivePreviewScreenState extends State<LivePreviewScreen> {
+            HttpServer? _server;
+            WebViewController? _controller;
+            String? _error;
+            bool _loading = true;
+            Uri? _previewUri;
+
+            @override
+            void initState() {
+              super.initState();
+              unawaited(_startPreviewServer());
+            }
+
+            Future<void> _startPreviewServer() async {
+              final previousServer = _server;
+              if (previousServer != null) {
+                try { await previousServer.close(force: true); } catch (_) {}
+                _server = null;
+              }
+              if (mounted) setState(() { _loading = true; _error = null; _controller = null; });
+              try {
+                if (!await File('${widget.root.path}${Platform.pathSeparator}index.html').exists()) {
+                  throw Exception('Preview index.html was not found in ${widget.root.path}.');
+                }
+                final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0, shared: false);
+                _server = server;
+                unawaited(server.forEach(_serveRequest));
+                final uri = Uri.parse('http://127.0.0.1:${server.port}/index.html');
+                final controller = WebViewController();
+                await controller.setJavaScriptMode(JavaScriptMode.unrestricted);
+                await controller.setNavigationDelegate(NavigationDelegate(
+                  onNavigationRequest: (request) {
+                    final target = Uri.tryParse(request.url);
+                    if (target != null && target.scheme == 'http' && target.host == '127.0.0.1' && target.port == server.port) {
+                      return NavigationDecision.navigate;
+                    }
+                    // Keep the local preview sandboxed to its own web bundle.
+                    return NavigationDecision.prevent;
+                  },
+                  onWebResourceError: (error) {
+                    if (error.isForMainFrame == true && mounted) setState(() => _error = 'Preview page error: ${error.description}');
+                  },
+                ));
+                _previewUri = uri;
+                _controller = controller;
+                await controller.loadRequest(uri);
+                if (mounted) setState(() { _loading = false; _error = null; });
+              } catch (error) {
+                if (mounted) setState(() { _loading = false; _error = error.toString(); });
+              }
+            }
+
+            Future<void> _serveRequest(HttpRequest request) async {
+              try {
+                final raw = request.uri.path == '/' ? 'index.html' : Uri.decodeComponent(request.uri.path.substring(1));
+                final segments = raw.replaceAll('\\', '/').split('/');
+                if (raw.startsWith('/') || segments.any((part) => part.isEmpty || part == '.' || part == '..') || raw.contains('\\')) {
+                  request.response.statusCode = HttpStatus.badRequest;
+                  await request.response.close();
+                  return;
+                }
+                final file = File('${widget.root.path}${Platform.pathSeparator}${segments.join(Platform.pathSeparator)}');
+                if (!await file.exists()) {
+                  request.response.statusCode = HttpStatus.notFound;
+                  request.response.headers.set(HttpHeaders.contentTypeHeader, 'text/plain; charset=utf-8');
+                  request.response.write('Not found: $raw');
+                  await request.response.close();
+                  return;
+                }
+                final extension = raw.contains('.') ? raw.split('.').last.toLowerCase() : '';
+                const mimeTypes = <String, String>{
+                  'html': 'text/html; charset=utf-8',
+                  'js': 'application/javascript; charset=utf-8',
+                  'mjs': 'application/javascript; charset=utf-8',
+                  'css': 'text/css; charset=utf-8',
+                  'json': 'application/json; charset=utf-8',
+                  'wasm': 'application/wasm',
+                  'svg': 'image/svg+xml',
+                  'png': 'image/png',
+                  'jpg': 'image/jpeg',
+                  'jpeg': 'image/jpeg',
+                  'webp': 'image/webp',
+                  'ico': 'image/x-icon',
+                  'woff': 'font/woff',
+                  'woff2': 'font/woff2',
+                  'ttf': 'font/ttf',
+                  'txt': 'text/plain; charset=utf-8',
+                  'xml': 'application/xml; charset=utf-8',
+                };
+                request.response.headers.set(HttpHeaders.contentTypeHeader, mimeTypes[extension] ?? 'application/octet-stream');
+                request.response.headers.set('X-Content-Type-Options', 'nosniff');
+                await request.response.addStream(file.openRead());
+                await request.response.close();
+              } catch (_) {
+                try { request.response.statusCode = HttpStatus.internalServerError; await request.response.close(); } catch (_) {}
+              }
+            }
+
+            Future<void> _retryPreview() async {
+              if (_controller == null || _previewUri == null) {
+                await _startPreviewServer();
+              } else {
+                await _reload();
+              }
+            }
+
+            Future<void> _reload() async {
+              final controller = _controller;
+              final uri = _previewUri;
+              if (controller == null || uri == null) return;
+              setState(() { _loading = true; _error = null; });
+              try {
+                await controller.reload();
+              } catch (error) {
+                if (mounted) setState(() => _error = error.toString());
+              } finally {
+                if (mounted) setState(() => _loading = false);
+              }
+            }
+
+            @override
+            void dispose() {
+              final server = _server;
+              if (server != null) unawaited(server.close(force: true));
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+              appBar: AppBar(title: Text(widget.title), actions: [IconButton(tooltip: 'Reload or retry preview', onPressed: _retryPreview, icon: const Icon(Icons.refresh))]),
+              body: Column(children: [
+                if (_loading) const LinearProgressIndicator(),
+                if (_error != null && _controller != null) Padding(padding: const EdgeInsets.all(10), child: SelectableText(_error!)),
+                Expanded(child: _controller != null
+                  ? WebViewWidget(controller: _controller!)
+                  : _loading
+                    ? const Center(child: CircularProgressIndicator())
+                    : Center(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisSize: MainAxisSize.min, children: [
+                        const Icon(Icons.web_asset_off, size: 48),
+                        const SizedBox(height: 12),
+                        Text(_error ?? 'Could not start the local preview.'),
+                        const SizedBox(height: 12),
+                        FilledButton.icon(onPressed: _retryPreview, icon: const Icon(Icons.refresh), label: const Text('Retry preview')),
+                      ])))),
+              ]),
             );
           }
 
@@ -2794,15 +3435,17 @@ jobs:
           # Builder launcher assets come from the template repository's root logo.png.
           # The monochrome alpha mask enables Android 13+ themed icons; the system chooses tint.
           if [[ -f "$GITHUB_WORKSPACE/logo.png" ]]; then
-            sudo apt-get update -qq
-            sudo apt-get install -y python3-pil
+            if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y python3-pil
+            fi
             python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets" true '#FFFFFF' true
             flutter pub add --dev flutter_launcher_icons:^0.14.4
             cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
             image_path: "assets/app_icon.png"
-            adaptive_icon_background: "#FFFFFF"
+            adaptive_icon_background: "assets/app_icon_background.png"
             adaptive_icon_foreground: "assets/app_icon_foreground.png"
             adaptive_icon_monochrome: "assets/app_icon_monochrome.png"
           ICONCONFIG
@@ -2811,7 +3454,8 @@ jobs:
             echo "::warning::logo.png was not found at the repository root; using Flutter's default launcher icon."
           fi
           flutter pub get
-          flutter build apk --release --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
+          python3 "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" "$BUILDER_DIR"
+          flutter build apk --release --no-pub --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/simple-app-builder.apk"
 
@@ -2941,12 +3585,20 @@ jobs:
           fi
           flutter pub get
 
+          # Best-effort compatibility repair for cached Flutter plugins with legacy or
+          # out-of-order Kotlin/Android Gradle plugin declarations. The same preflight
+          # also runs when building the builder APK itself.
+          python3 "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" "$TARGET_DIR"
+
       - name: Apply selected image or repository logo.png to Android launcher icons
-        if: ${{ github.event_name == 'repository_dispatch' }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format != 'web_preview' }}
         shell: bash
         env:
           ICON_PATH: ${{ github.event.client_payload.icon_path }}
           HAS_CUSTOM_ICON: ${{ github.event.client_payload.has_custom_icon }}
+          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
+          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
+          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -2968,8 +3620,10 @@ jobs:
             echo 'No project-specific icon and no logo.png fallback were found; keeping Flutter launcher icons.'
             exit 0
           fi
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-pil
+          if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y python3-pil
+          fi
           mkdir -p "$TARGET_DIR/assets"
           REMOVE_BACKGROUND="${REMOVE_BACKGROUND:-true}"
           ICON_BACKGROUND_COLOR="${ICON_BACKGROUND_COLOR:-#FFFFFF}"
@@ -2982,9 +3636,13 @@ jobs:
           # use a neutral adaptive background. The monochrome mask still removes white.
           PROCESS_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
           ADAPTIVE_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
-          if [[ "${REMOVE_BACKGROUND,,}" != "true" ]]; then
+          if [[ "${REMOVE_BACKGROUND,,}" == "true" ]]; then
+            # For true transparency, adaptive_icon_background must be a PNG asset,
+            # not a hex color (a hex color necessarily paints a solid square).
+            ADAPTIVE_BACKGROUND_COLOR="assets/app_icon_background.png"
+          else
             PROCESS_BACKGROUND_COLOR="#FFFFFF"
-            ADAPTIVE_BACKGROUND_COLOR="#FFFFFF"
+            ADAPTIVE_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
           fi
           python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets" "$REMOVE_BACKGROUND" "$PROCESS_BACKGROUND_COLOR" "$DYNAMIC_THEMED_ICON"
           cd "$TARGET_DIR"
@@ -3005,22 +3663,223 @@ jobs:
           dart run flutter_launcher_icons
           echo 'Applied color, round, and adaptive launcher icons using the selected background options.'
 
-      - name: Build generated release APK
-        if: ${{ github.event_name == 'repository_dispatch' }}
+      - name: Configure Android release signing (optional)
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sign_release == true && (github.event.client_payload.build_format == '' || github.event.client_payload.build_format == 'apk' || github.event.client_payload.build_format == 'aab') }}
         shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP/generated_flutter_app"
-          flutter build apk --release
+          if [[ -z "$ANDROID_KEYSTORE_BASE64" || -z "$ANDROID_KEYSTORE_PASSWORD" || -z "$ANDROID_KEY_PASSWORD" || -z "$ANDROID_KEY_ALIAS" ]]; then
+            echo 'Signing was requested, but one or more required Actions secrets are missing.' >&2
+            echo 'Set ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_PASSWORD, ANDROID_KEY_ALIAS in Settings > Secrets and variables > Actions.' >&2
+            exit 1
+          fi
+          TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$TARGET_DIR/android/upload-keystore.jks"
+          cat > "$TARGET_DIR/android/key.properties" <<KEYPROPS
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=../upload-keystore.jks
+          KEYPROPS
+          python3 - "$TARGET_DIR" <<'PYSIGN'
+          import re, sys
+          from pathlib import Path
+          
+          def block_range(source, pattern):
+              match = re.search(pattern, source, re.M)
+              if not match:
+                  return None
+              opening = source.find('{', match.start())
+              if opening < 0:
+                  return None
+              depth = 0
+              quote = None
+              escaped = False
+              for index in range(opening, len(source)):
+                  char = source[index]
+                  if quote:
+                      if escaped:
+                          escaped = False
+                      elif char == '\\':
+                          escaped = True
+                      elif char == quote:
+                          quote = None
+                      continue
+                  if char in ('"', "'"):
+                      quote = char
+                  elif char == '{':
+                      depth += 1
+                  elif char == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return opening, index
+              return None
+          
+          def insert_line_before(source, index, content):
+              line_start = source.rfind('\n', 0, index) + 1
+              return source[:line_start] + content.rstrip() + '\n' + source[line_start:]
+          
+          root = Path(sys.argv[1])
+          groovy = root / 'android/app/build.gradle'
+          kotlin = root / 'android/app/build.gradle.kts'
+          gradle = groovy if groovy.exists() else kotlin
+          if not gradle.exists():
+              raise SystemExit('Could not find app/build.gradle or app/build.gradle.kts for signing.')
+          text = gradle.read_text(encoding='utf-8')
+          is_kts = gradle.suffix == '.kts'
+          if 'import java.util.Properties' not in text:
+              text = 'import java.util.Properties\nimport java.io.FileInputStream\n' + text
+          if is_kts:
+              props = '''val keystoreProperties = Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) { keystoreProperties.load(FileInputStream(keystorePropertiesFile)) }
+          '''
+          else:
+              props = '''def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file('key.properties')
+          if (keystorePropertiesFile.exists()) { keystoreProperties.load(new FileInputStream(keystorePropertiesFile)) }
+          '''
+          if 'keystorePropertiesFile' not in text:
+              android_match = re.search(r'(?m)^android\s*\{', text)
+              if not android_match:
+                  raise SystemExit('Could not find android { in app Gradle file; signing config cannot be applied safely.')
+              text = text[:android_match.start()] + props.rstrip() + '\n\n' + text[android_match.start():]
+          
+          if is_kts:
+              release_entry = '''        create("release") {
+                      keyAlias = keystoreProperties["keyAlias"] as String
+                      keyPassword = keystoreProperties["keyPassword"] as String
+                      storeFile = file(keystoreProperties["storeFile"] as String)
+                      storePassword = keystoreProperties["storePassword"] as String
+                  }
+          '''
+          else:
+              release_entry = '''        release {
+                      keyAlias keystoreProperties['keyAlias']
+                      keyPassword keystoreProperties['keyPassword']
+                      storeFile file(keystoreProperties['storeFile'])
+                      storePassword keystoreProperties['storePassword']
+                  }
+          '''
+          config_range = block_range(text, r'(?m)^\s*signingConfigs\s*\{')
+          config_text = text[config_range[0]:config_range[1]+1] if config_range else ''
+          if is_kts:
+              has_release_config = 'create("release")' in config_text or bool(re.search(r'(?m)^\s*getByName\("release"\)\s*\{', config_text))
+          else:
+              has_release_config = bool(re.search(r'(?m)^\s*release\s*\{', config_text))
+          if not has_release_config:
+              if config_range:
+                  text = insert_line_before(text, config_range[1], release_entry)
+              else:
+                  build_types = re.search(r'(?m)^\s*buildTypes\s*\{', text)
+                  if not build_types:
+                      raise SystemExit('Could not find buildTypes { in app Gradle file; signing config cannot be applied safely.')
+                  if is_kts:
+                      block = '''    signingConfigs {
+                  create("release") {
+                      keyAlias = keystoreProperties["keyAlias"] as String
+                      keyPassword = keystoreProperties["keyPassword"] as String
+                      storeFile = file(keystoreProperties["storeFile"] as String)
+                      storePassword = keystoreProperties["storePassword"] as String
+                  }
+              }
+          '''
+                  else:
+                      block = '''    signingConfigs {
+                  release {
+                      keyAlias keystoreProperties['keyAlias']
+                      keyPassword keystoreProperties['keyPassword']
+                      storeFile file(keystoreProperties['storeFile'])
+                      storePassword keystoreProperties['storePassword']
+                  }
+              }
+          '''
+                  text = insert_line_before(text, build_types.start(), block)
+          
+          build_range = block_range(text, r'(?m)^\s*buildTypes\s*\{')
+          if not build_range:
+              raise SystemExit('Could not locate buildTypes block for release signing.')
+          build_body = text[build_range[0]+1:build_range[1]]
+          release_range = block_range(build_body, r'(?m)^\s*release\s*\{')
+          if not release_range:
+              raise SystemExit('Could not locate buildTypes.release block for release signing.')
+          release_body = build_body[release_range[0]+1:release_range[1]]
+          if is_kts:
+              release_body = re.sub(r'signingConfig\s*=\s*signingConfigs(?:\.debug|\.getByName\(["\']debug["\']\))', 'signingConfig = signingConfigs.getByName("release")', release_body)
+              if not re.search(r'(?m)^\s*signingConfig\s*=', release_body):
+                  release_body = '\n            signingConfig = signingConfigs.getByName("release")' + release_body
+          else:
+              release_body = re.sub(r'signingConfig\s+(?:signingConfigs\.debug|signingConfigs\.getByName\(["\']debug["\']\))', 'signingConfig signingConfigs.release', release_body)
+              if not re.search(r'(?m)^\s*signingConfig\s+', release_body):
+                  release_body = '\n            signingConfig signingConfigs.release' + release_body
+          absolute_release_start = build_range[0] + 1 + release_range[0] + 1
+          absolute_release_end = build_range[0] + 1 + release_range[1]
+          text = text[:absolute_release_start] + release_body + text[absolute_release_end:]
+          gradle.write_text(text, encoding='utf-8')
+          print(f'Configured optional release signing in {gradle}; keystore secrets were not logged.')
+          PYSIGN
+
+      - name: Build requested output
+        if: ${{ github.event_name == 'repository_dispatch' }}
+        shell: bash
+        env:
+          BUILD_FORMAT: ${{ github.event.client_payload.build_format }}
+          SIGN_RELEASE: ${{ github.event.client_payload.sign_release }}
+        run: |
+          set -euo pipefail
+          TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.apk"
+          cd "$TARGET_DIR"
+          BUILD_FORMAT="${BUILD_FORMAT:-apk}"
+          case "$BUILD_FORMAT" in
+            web_preview)
+              echo 'Building Flutter Web preview. This compiles the source for web; no Android package is created.'
+              flutter create --platforms=web .
+              flutter build web --release --no-pub
+              (cd build/web && zip -q -r "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-web.zip" .)
+              ;;
+            aab)
+              flutter build appbundle --release --no-pub
+              cp build/app/outputs/bundle/release/app-release.aab "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.aab"
+              ;;
+            apk)
+              flutter build apk --release --no-pub
+              cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.apk"
+              ;;
+            *) echo "Unsupported build format: $BUILD_FORMAT" >&2; exit 1 ;;
+          esac
 
       - name: Upload generated release APK
-        if: ${{ github.event_name == 'repository_dispatch' }}
+        if: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.build_format == '' || github.event.client_payload.build_format == 'apk') }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-apk-${{ steps.metadata.outputs.slug }}
           path: dist/${{ steps.metadata.outputs.slug }}-release.apk
           if-no-files-found: error
           retention-days: 30
+          compression-level: 0
+
+      - name: Upload generated Android App Bundle
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format == 'aab' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-aab-${{ steps.metadata.outputs.slug }}
+          path: dist/${{ steps.metadata.outputs.slug }}-release.aab
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload generated Flutter Web preview
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format == 'web_preview' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-web-${{ steps.metadata.outputs.slug }}
+          path: dist/${{ steps.metadata.outputs.slug }}-web.zip
+          if-no-files-found: error
+          retention-days: 7
           compression-level: 0
