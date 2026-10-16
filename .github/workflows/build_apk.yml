@@ -1,0 +1,1342 @@
+name: Build Simple App Builder and Generated APK
+
+# The builder app itself is generated from the embedded Dart source below.
+# Each run also compiles the user-supplied dart_code into a separate release APK.
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Human-readable Android app name (1–60 characters)'
+        required: true
+        type: string
+      package_name:
+        description: 'Android application ID, e.g. com.example.myapp'
+        required: true
+        type: string
+      dart_code:
+        description: 'Complete contents of lib/main.dart for the app to generate'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Do not expose PATs as workflow secrets. The mobile app stores them locally and
+# sends authenticated REST API requests directly to GitHub to dispatch this job.
+jobs:
+  build:
+    name: Generate app builder and requested Flutter APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Validate workflow inputs
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          DART_CODE: ${{ inputs.dart_code }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, sys
+          name = os.environ.get('PROJECT_NAME', '').strip()
+          package = os.environ.get('PACKAGE_NAME', '').strip()
+          source = os.environ.get('DART_CODE', '')
+          if not name or len(name) > 60 or any(ord(c) < 32 for c in name):
+              sys.exit('project_name must be 1–60 characters and contain no control characters.')
+          if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}', package):
+              sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
+          if not source.strip():
+              sys.exit('dart_code must contain a complete Flutter main.dart file.')
+          if len(source.encode('utf-8')) > 50000:
+              sys.exit('dart_code exceeds 50 KB. Reduce it or split code into a project package before dispatching.')
+          print('Input validation passed.')
+          PY
+
+      - name: Prepare artifact name
+        id: metadata
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+        run: |
+          set -euo pipefail
+          slug="$(printf '%s' "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
+          if [[ -z "$slug" ]]; then slug="flutter-app"; fi
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Zulu Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: zulu
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+          pub-cache: true
+
+      # Helper applies consistent Android metadata and internet permission. New Flutter
+      # templates use build.gradle.kts; the fallback handles older Groovy templates.
+      - name: Create Android project patch helper
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/patch_android_project.py" <<'PY'
+          import re, sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          project = Path(sys.argv[1])
+          app_label = sys.argv[2]
+          application_id = sys.argv[3]
+          manifest = project / 'android/app/src/main/AndroidManifest.xml'
+          android_ns = 'http://schemas.android.com/apk/res/android'
+          ET.register_namespace('android', android_ns)
+          tree = ET.parse(manifest)
+          root = tree.getroot()
+          app = root.find('application')
+          if app is None:
+              raise SystemExit(f'No <application> element in {manifest}')
+          app.set(f'{{{android_ns}}}label', app_label)
+          internet = f'{{{android_ns}}}name'
+          if not any(node.tag == 'uses-permission' and node.get(internet) == 'android.permission.INTERNET' for node in root):
+              permission = ET.Element('uses-permission')
+              permission.set(internet, 'android.permission.INTERNET')
+              root.insert(0, permission)
+          tree.write(manifest, encoding='utf-8', xml_declaration=True)
+
+          gradle_files = [project / 'android/app/build.gradle.kts', project / 'android/app/build.gradle']
+          gradle = next((p for p in gradle_files if p.exists()), None)
+          if gradle is None:
+              raise SystemExit('Could not locate android/app/build.gradle(.kts)')
+          data = gradle.read_text(encoding='utf-8')
+          data = re.sub(r'namespace\s*=\s*["\'][^"\']+["\']', f'namespace = "{application_id}"', data, count=1)
+          data = re.sub(r'applicationId\s*=\s*["\'][^"\']+["\']', f'applicationId = "{application_id}"', data, count=1)
+          data = data.replace('minSdk = flutter.minSdkVersion', 'minSdk = 23')
+          data = data.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 23')
+          gradle.write_text(data, encoding='utf-8')
+          PY
+
+      - name: Generate the real Simple App Builder application
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUILDER_DIR="$RUNNER_TEMP/simple_app_builder"
+          OWNER_SLUG="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_]+/_/g')"
+          BUILDER_ORG="com.builder_${OWNER_SLUG}"
+          BUILDER_PACKAGE="${BUILDER_ORG}.simple_app_builder"
+          flutter create --org "$BUILDER_ORG" --project-name simple_app_builder "$BUILDER_DIR"
+          cd "$BUILDER_DIR"
+          flutter pub add dynamic_color flutter_secure_storage shared_preferences http file_picker flutter_code_editor flutter_highlight highlight archive url_launcher
+          python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE"
+          cat > lib/main.dart <<'DART'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:typed_data';
+
+          import 'package:archive/archive.dart';
+          import 'package:dynamic_color/dynamic_color.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter_code_editor/flutter_code_editor.dart';
+          import 'package:flutter_highlight/themes/github.dart';
+          import 'package:flutter_highlight/themes/monokai-sublime.dart';
+          import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+          import 'package:highlight/languages/dart.dart' as dart_language;
+          import 'package:highlight/languages/yaml.dart' as yaml_language;
+          import 'package:http/http.dart' as http;
+          import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:url_launcher/url_launcher.dart';
+
+          const String compiledRepository = String.fromEnvironment(
+            'BUILDER_REPOSITORY',
+            defaultValue: '',
+          );
+          const String workflowFile = 'build_apk.yml';
+          const FlutterSecureStorage secureStorage = FlutterSecureStorage();
+
+          void main() => runApp(const SimpleAppBuilder());
+
+          class GitHubAccount {
+            const GitHubAccount({required this.username, required this.token});
+
+            final String username;
+            final String token;
+
+            Map<String, dynamic> toJson() => {'username': username, 'token': token};
+
+            factory GitHubAccount.fromJson(Map<String, dynamic> json) => GitHubAccount(
+                  username: (json['username'] ?? '').toString(),
+                  token: (json['token'] ?? '').toString(),
+                );
+          }
+
+          class AppProject {
+            const AppProject({
+              required this.id,
+              required this.name,
+              required this.packageName,
+              required this.dartCode,
+              this.iconBase64,
+            });
+
+            final String id;
+            final String name;
+            final String packageName;
+            final String dartCode;
+            final String? iconBase64;
+
+            AppProject copyWith({
+              String? name,
+              String? packageName,
+              String? dartCode,
+              String? iconBase64,
+              bool clearIcon = false,
+            }) => AppProject(
+                  id: id,
+                  name: name ?? this.name,
+                  packageName: packageName ?? this.packageName,
+                  dartCode: dartCode ?? this.dartCode,
+                  iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
+                );
+
+            Map<String, dynamic> toJson() => {
+                  'id': id,
+                  'name': name,
+                  'packageName': packageName,
+                  'dartCode': dartCode,
+                  'iconBase64': iconBase64,
+                };
+
+            factory AppProject.fromJson(Map<String, dynamic> json) => AppProject(
+                  id: (json['id'] ?? DateTime.now().microsecondsSinceEpoch).toString(),
+                  name: (json['name'] ?? 'Untitled app').toString(),
+                  packageName: (json['packageName'] ?? 'com.example.myapp').toString(),
+                  dartCode: (json['dartCode'] ?? '').toString(),
+                  iconBase64: json['iconBase64']?.toString(),
+                );
+          }
+
+          class GitHubApi {
+            GitHubApi({
+              required this.repository,
+              required this.accounts,
+              required this.autoFailover,
+              this.onPromote,
+            });
+
+            final String repository;
+            final List<GitHubAccount> accounts;
+            final bool autoFailover;
+            final void Function(GitHubAccount account)? onPromote;
+
+            String get _repoPath => '/repos/$repository';
+
+            Future<http.Response> request(
+              String method,
+              String path, {
+              Object? body,
+            }) async {
+              if (accounts.isEmpty) throw Exception('Add a GitHub account in Settings first.');
+              final candidates = autoFailover ? accounts : <GitHubAccount>[accounts.first];
+              http.Response? lastResponse;
+              Object? lastError;
+
+              for (var index = 0; index < candidates.length; index++) {
+                final account = candidates[index];
+                try {
+                  final headers = <String, String>{
+                    'Accept': 'application/vnd.github+json',
+                    'Authorization': 'Bearer ${account.token}',
+                    'X-GitHub-Api-Version': '2022-11-28',
+                    'User-Agent': 'Simple-App-Builder',
+                  };
+                  if (body != null) headers['Content-Type'] = 'application/json; charset=utf-8';
+                  final uri = path.startsWith('https://')
+                      ? Uri.parse(path)
+                      : Uri.parse('https://api.github.com$path');
+                  late final http.Response response;
+                  switch (method.toUpperCase()) {
+                    case 'GET':
+                      response = await http.get(uri, headers: headers).timeout(const Duration(seconds: 45));
+                      break;
+                    case 'POST':
+                      response = await http.post(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                      break;
+                    case 'PUT':
+                      response = await http.put(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                      break;
+                    case 'DELETE':
+                      response = await http.delete(uri, headers: headers, body: body == null ? null : jsonEncode(body)).timeout(const Duration(seconds: 45));
+                      break;
+                    default:
+                      throw UnsupportedError('Unsupported HTTP method: $method');
+                  }
+                  lastResponse = response;
+                  final remaining = response.headers['x-ratelimit-remaining'];
+                  final retryable = response.statusCode == 401 ||
+                      response.statusCode == 403 ||
+                      response.statusCode == 429 ||
+                      remaining == '0';
+                  if (retryable && autoFailover && index < candidates.length - 1) {
+                    continue;
+                  }
+                  if (response.statusCode < 400 && index > 0) onPromote?.call(account);
+                  return response;
+                } catch (error) {
+                  lastError = error;
+                  if (!autoFailover || index == candidates.length - 1) break;
+                }
+              }
+              if (lastResponse != null) return lastResponse;
+              throw Exception('GitHub API request failed: ${lastError ?? 'unknown network error'}');
+            }
+
+            Map<String, dynamic> checkedJson(http.Response response) {
+              dynamic parsed;
+              try {
+                parsed = jsonDecode(response.body);
+              } catch (_) {
+                parsed = null;
+              }
+              if (response.statusCode < 200 || response.statusCode >= 300) {
+                final message = (parsed is Map ? (parsed['message'] ?? response.body) : response.body).toString();
+                final excerpt = message.length > 350 ? message.substring(0, 350) : message;
+                throw Exception('GitHub API ${response.statusCode}: $excerpt');
+              }
+              if (parsed is! Map<String, dynamic>) throw Exception('GitHub returned an unexpected response.');
+              return parsed;
+            }
+
+            Future<String> defaultBranch() async {
+              final json = checkedJson(await request('GET', _repoPath));
+              return (json['default_branch'] ?? 'main').toString();
+            }
+
+            Future<String> readWorkflow(String branch) async {
+              final uriPath = '$_repoPath/contents/.github/workflows/$workflowFile?ref=${Uri.encodeQueryComponent(branch)}';
+              final json = checkedJson(await request('GET', uriPath));
+              final encoded = (json['content'] ?? '').toString().replaceAll(RegExp(r'\s'), '');
+              return utf8.decode(base64.decode(encoded));
+            }
+
+            Future<void> saveWorkflow(String branch, String source) async {
+              final uriPath = '$_repoPath/contents/.github/workflows/$workflowFile?ref=${Uri.encodeQueryComponent(branch)}';
+              final current = checkedJson(await request('GET', uriPath));
+              checkedJson(await request('PUT', '$_repoPath/contents/.github/workflows/$workflowFile', body: {
+                'message': 'Update build workflow from Simple App Builder',
+                'content': base64Encode(utf8.encode(source)),
+                'branch': branch,
+                'sha': current['sha'],
+              }));
+            }
+
+            Future<void> uploadRootIcon(String branch, Uint8List bytes) async {
+              final path = '$_repoPath/contents/icon.png?ref=${Uri.encodeQueryComponent(branch)}';
+              final existing = await request('GET', path);
+              String? sha;
+              if (existing.statusCode == 200) {
+                sha = (jsonDecode(existing.body) as Map<String, dynamic>)['sha']?.toString();
+              } else if (existing.statusCode != 404) {
+                checkedJson(existing);
+              }
+              final body = <String, dynamic>{
+                'message': 'Update app icon from Simple App Builder',
+                'content': base64Encode(bytes),
+                'branch': branch,
+              };
+              if (sha != null) body['sha'] = sha;
+              checkedJson(await request('PUT', '$_repoPath/contents/icon.png', body: body));
+            }
+
+            Future<void> dispatchBuild({
+              required String branch,
+              required String projectName,
+              required String packageName,
+              required String dartCode,
+            }) async {
+              final response = await request('POST', '$_repoPath/actions/workflows/$workflowFile/dispatches', body: {
+                'ref': branch,
+                'inputs': {
+                  'project_name': projectName,
+                  'package_name': packageName,
+                  'dart_code': dartCode,
+                },
+              });
+              if (response.statusCode != 204 && response.statusCode != 201) {
+                checkedJson(response);
+                throw Exception('GitHub did not accept the workflow dispatch.');
+              }
+            }
+
+            Future<int> latestWorkflowRunNumber() async {
+              final result = checkedJson(await request(
+                'GET',
+                '$_repoPath/actions/workflows/$workflowFile/runs?event=workflow_dispatch&per_page=1',
+              ));
+              final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
+                  .whereType<Map<String, dynamic>>()
+                  .toList();
+              if (runs.isEmpty) return 0;
+              return (runs.first['run_number'] as int?) ?? 0;
+            }
+
+            Future<Map<String, dynamic>> waitForBuild(
+              int previousRunNumber,
+              void Function(String message) onStatus,
+            ) async {
+              for (var attempt = 0; attempt < 360; attempt++) {
+                await Future<void>.delayed(const Duration(seconds: 5));
+                final result = checkedJson(await request(
+                  'GET',
+                  '$_repoPath/actions/workflows/$workflowFile/runs?event=workflow_dispatch&per_page=20',
+                ));
+                final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
+                    .whereType<Map<String, dynamic>>()
+                    .where((run) => ((run['run_number'] as int?) ?? 0) > previousRunNumber)
+                    .toList()
+                  ..sort((a, b) => (b['run_number'] as int? ?? 0).compareTo(a['run_number'] as int? ?? 0));
+                if (runs.isEmpty) {
+                  onStatus('Waiting for GitHub to register the build…');
+                  continue;
+                }
+                final run = runs.first;
+                final status = (run['status'] ?? 'queued').toString();
+                final number = run['run_number']?.toString() ?? '';
+                onStatus('Workflow #$number: $status');
+                if (status == 'completed') {
+                  if (run['conclusion'] != 'success') {
+                    final url = (run['html_url'] ?? '').toString();
+                    throw Exception('The build failed. Open the workflow run for the compiler log: $url');
+                  }
+                  return run;
+                }
+              }
+              throw TimeoutException('Build did not finish within 30 minutes. Check the Actions tab in GitHub.');
+            }
+
+            Future<Uint8List> downloadGeneratedApk(String runId) async {
+              final json = checkedJson(await request('GET', '$_repoPath/actions/runs/$runId/artifacts?per_page=100'));
+              final artifacts = (json['artifacts'] as List<dynamic>? ?? const []).whereType<Map<String, dynamic>>();
+              final artifact = artifacts.where((a) =>
+                (a['name'] ?? '').toString().startsWith('generated-apk-') && a['expired'] != true).toList();
+              if (artifact.isEmpty) throw Exception('The workflow succeeded but the generated APK artifact was not found.');
+              final id = artifact.first['id'].toString();
+              final response = await request('GET', '$_repoPath/actions/artifacts/$id/zip');
+              if (response.statusCode != 200) throw Exception('Could not download the APK artifact (${response.statusCode}).');
+              return response.bodyBytes;
+            }
+          }
+
+          Future<String?> verifyAccount(String username, String token) async {
+            try {
+              final response = await http.get(
+                Uri.https('api.github.com', '/user'),
+                headers: {
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer $token',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'Simple-App-Builder',
+                },
+              ).timeout(const Duration(seconds: 30));
+              if (response.statusCode != 200) {
+                return 'GitHub rejected this token (HTTP ${response.statusCode}). Check the token and its scopes.';
+              }
+              final actual = (jsonDecode(response.body) as Map<String, dynamic>)['login'].toString();
+              if (actual.toLowerCase() != username.trim().toLowerCase()) {
+                return 'This token belongs to "$actual", not "${username.trim()}".';
+              }
+              return null;
+            } catch (error) {
+              return 'Could not verify the account: $error';
+            }
+          }
+
+          class SimpleAppBuilder extends StatefulWidget {
+            const SimpleAppBuilder({super.key});
+
+            @override
+            State<SimpleAppBuilder> createState() => _SimpleAppBuilderState();
+          }
+
+          class _SimpleAppBuilderState extends State<SimpleAppBuilder> {
+            bool _ready = false;
+            List<GitHubAccount> _accounts = [];
+            List<AppProject> _projects = [];
+            bool _autoFailover = true;
+            String _repository = compiledRepository;
+
+            @override
+            void initState() {
+              super.initState();
+              _loadState();
+            }
+
+            Future<void> _loadState() async {
+              final prefs = await SharedPreferences.getInstance();
+              try {
+                final rawAccounts = await secureStorage.read(key: 'github_accounts_v1');
+                if (rawAccounts != null) {
+                  _accounts = (jsonDecode(rawAccounts) as List<dynamic>)
+                      .whereType<Map<String, dynamic>>()
+                      .map(GitHubAccount.fromJson)
+                      .where((a) => a.username.isNotEmpty && a.token.isNotEmpty)
+                      .toList();
+                }
+              } catch (_) {
+                _accounts = [];
+              }
+              try {
+                final rawProjects = prefs.getString('projects_v1');
+                if (rawProjects != null) {
+                  _projects = (jsonDecode(rawProjects) as List<dynamic>)
+                      .whereType<Map<String, dynamic>>()
+                      .map(AppProject.fromJson)
+                      .toList();
+                }
+              } catch (_) {
+                _projects = [];
+              }
+              _autoFailover = prefs.getBool('auto_failover') ?? true;
+              _repository = prefs.getString('repository') ?? compiledRepository;
+              if (mounted) setState(() => _ready = true);
+            }
+
+            Future<void> _saveAccounts(List<GitHubAccount> accounts) async {
+              _accounts = List<GitHubAccount>.from(accounts);
+              await secureStorage.write(
+                key: 'github_accounts_v1',
+                value: jsonEncode(_accounts.map((a) => a.toJson()).toList()),
+              );
+              if (mounted) setState(() {});
+            }
+
+            Future<void> _saveProjects(List<AppProject> projects) async {
+              _projects = List<AppProject>.from(projects);
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('projects_v1', jsonEncode(_projects.map((p) => p.toJson()).toList()));
+              if (mounted) setState(() {});
+            }
+
+            Future<void> _saveFailover(bool enabled) async {
+              _autoFailover = enabled;
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool('auto_failover', enabled);
+              if (mounted) setState(() {});
+            }
+
+            Future<void> _saveRepository(String repository) async {
+              _repository = repository.trim();
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setString('repository', _repository);
+              if (mounted) setState(() {});
+            }
+
+            void _promoteAccount(GitHubAccount account) {
+              final next = <GitHubAccount>[
+                account,
+                ..._accounts.where((a) => a.username.toLowerCase() != account.username.toLowerCase()),
+              ];
+              unawaited(_saveAccounts(next));
+            }
+
+            GitHubApi _api() => GitHubApi(
+                  repository: _repository,
+                  accounts: List<GitHubAccount>.from(_accounts),
+                  autoFailover: _autoFailover,
+                  onPromote: _promoteAccount,
+                );
+
+            ThemeData _theme(ColorScheme scheme) => ThemeData(
+                  colorScheme: scheme,
+                  useMaterial3: true,
+                  scaffoldBackgroundColor: scheme.surface,
+                  appBarTheme: const AppBarThemeData(centerTitle: false),
+                  inputDecorationTheme: const InputDecorationThemeData(
+                    border: OutlineInputBorder(),
+                    filled: true,
+                  ),
+                  cardTheme: const CardThemeData(clipBehavior: Clip.antiAlias),
+                );
+
+            @override
+            Widget build(BuildContext context) => DynamicColorBuilder(
+                  builder: (lightDynamic, darkDynamic) {
+                    final light = lightDynamic ?? ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4));
+                    final dark = darkDynamic ?? ColorScheme.fromSeed(seedColor: const Color(0xFFD0BCFF), brightness: Brightness.dark);
+                    return MaterialApp(
+                      title: 'Simple App Builder',
+                      debugShowCheckedModeBanner: false,
+                      theme: _theme(light),
+                      darkTheme: _theme(dark),
+                      themeMode: ThemeMode.system,
+                      home: !_ready
+                          ? const _LoadingScreen()
+                          : _accounts.isEmpty
+                              ? SetupScreen(onSetup: (account) async {
+                                  await _saveAccounts([account]);
+                                })
+                              : DashboardScreen(
+                                  accounts: _accounts,
+                                  projects: _projects,
+                                  autoFailover: _autoFailover,
+                                  repository: _repository,
+                                  apiFactory: _api,
+                                  onAccountsChanged: _saveAccounts,
+                                  onProjectsChanged: _saveProjects,
+                                  onFailoverChanged: _saveFailover,
+                                  onRepositoryChanged: _saveRepository,
+                                ),
+                    );
+                  },
+                );
+          }
+
+          class _LoadingScreen extends StatelessWidget {
+            const _LoadingScreen();
+            @override
+            Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+          }
+
+          class SetupScreen extends StatefulWidget {
+            const SetupScreen({super.key, required this.onSetup});
+            final Future<void> Function(GitHubAccount account) onSetup;
+
+            @override
+            State<SetupScreen> createState() => _SetupScreenState();
+          }
+
+          class _SetupScreenState extends State<SetupScreen> {
+            final _username = TextEditingController();
+            final _token = TextEditingController();
+            bool _busy = false;
+            bool _obscure = true;
+            String? _error;
+
+            @override
+            void dispose() {
+              _username.dispose();
+              _token.dispose();
+              super.dispose();
+            }
+
+            Future<void> _connect() async {
+              if (_username.text.trim().isEmpty || _token.text.trim().isEmpty) {
+                setState(() => _error = 'Enter both your GitHub username and personal access token.');
+                return;
+              }
+              setState(() { _busy = true; _error = null; });
+              final username = _username.text.trim();
+              final token = _token.text.trim();
+              final error = await verifyAccount(username, token);
+              if (error != null) {
+                if (mounted) setState(() { _busy = false; _error = error; });
+                return;
+              }
+              await widget.onSetup(GitHubAccount(username: username, token: token));
+              if (mounted) setState(() => _busy = false);
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: const Text('Set up GitHub')),
+                  body: Center(
+                    child: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 680),
+                      child: ListView(
+                        padding: const EdgeInsets.all(20),
+                        children: [
+                          const Icon(Icons.rocket_launch_rounded, size: 58),
+                          const SizedBox(height: 12),
+                          Text('Connect your GitHub account', style: Theme.of(context).textTheme.headlineSmall),
+                          const SizedBox(height: 8),
+                          const Text('Your account is used to trigger the workflow in the repository this builder was compiled for. Tokens are stored using Android secure storage and are not written to build logs.'),
+                          const SizedBox(height: 20),
+                          TextField(controller: _username, textInputAction: TextInputAction.next, autocorrect: false, decoration: const InputDecoration(labelText: 'GitHub username', prefixIcon: Icon(Icons.person_outline))),
+                          const SizedBox(height: 12),
+                          TextField(controller: _token, obscureText: _obscure, autocorrect: false, enableSuggestions: false, decoration: InputDecoration(labelText: 'Personal access token (classic)', prefixIcon: const Icon(Icons.key_outlined), suffixIcon: IconButton(onPressed: () => setState(() => _obscure = !_obscure), icon: Icon(_obscure ? Icons.visibility : Icons.visibility_off)))),
+                          if (_error != null) ...[
+                            const SizedBox(height: 12),
+                            Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                          ],
+                          const SizedBox(height: 14),
+                          FilledButton.icon(onPressed: _busy ? null : _connect, icon: _busy ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.link), label: Text(_busy ? 'Verifying account…' : 'Verify and continue')),
+                          const SizedBox(height: 24),
+                          Text('Create a classic GitHub token', style: Theme.of(context).textTheme.titleLarge),
+                          const SizedBox(height: 8),
+                          const SelectableText('1. Sign in to GitHub and open Settings.\n2. Go to Developer settings → Personal access tokens → Tokens (classic).\n3. Select Generate new token (classic), give it a clear name and expiry.\n4. Explicitly check BOTH scopes: repo and workflow.\n5. Generate the token and copy it immediately. GitHub only shows the full value once.\n6. Return here and paste the token. Never commit it to a repository or share it in Dart code.'),
+                          const SizedBox(height: 10),
+                          OutlinedButton.icon(onPressed: () => launchUrl(Uri.parse('https://github.com/settings/tokens/new?scopes=repo,workflow&description=Simple%20App%20Builder'), mode: LaunchMode.externalApplication), icon: const Icon(Icons.open_in_new), label: const Text('Open classic token creation page')),
+                          const SizedBox(height: 8),
+                          const Text('The repository must contain .github/workflows/build_apk.yml on its default branch, and GitHub Actions must be enabled.'),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+          }
+
+          class DashboardScreen extends StatefulWidget {
+            const DashboardScreen({
+              super.key,
+              required this.accounts,
+              required this.projects,
+              required this.autoFailover,
+              required this.repository,
+              required this.apiFactory,
+              required this.onAccountsChanged,
+              required this.onProjectsChanged,
+              required this.onFailoverChanged,
+              required this.onRepositoryChanged,
+            });
+
+            final List<GitHubAccount> accounts;
+            final List<AppProject> projects;
+            final bool autoFailover;
+            final String repository;
+            final GitHubApi Function() apiFactory;
+            final Future<void> Function(List<GitHubAccount>) onAccountsChanged;
+            final Future<void> Function(List<AppProject>) onProjectsChanged;
+            final Future<void> Function(bool) onFailoverChanged;
+            final Future<void> Function(String) onRepositoryChanged;
+
+            @override
+            State<DashboardScreen> createState() => _DashboardScreenState();
+          }
+
+          class _DashboardScreenState extends State<DashboardScreen> {
+            Future<void> _openWizard({AppProject? project}) async {
+              await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => ProjectWizard(
+                existing: project,
+                repository: widget.repository,
+                apiFactory: widget.apiFactory,
+                onSaveProject: (updated) async {
+                  final next = List<AppProject>.from(widget.projects);
+                  final index = next.indexWhere((p) => p.id == updated.id);
+                  if (index == -1) { next.insert(0, updated); } else { next[index] = updated; }
+                  await widget.onProjectsChanged(next);
+                },
+              )));
+            }
+
+            Future<void> _rename(AppProject project) async {
+              final controller = TextEditingController(text: project.name);
+              final name = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Rename project'),
+                content: TextField(controller: controller, autofocus: true, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name')),
+                actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('Save'))],
+              ));
+              controller.dispose();
+              if (name == null || name.isEmpty) return;
+              final next = widget.projects.map((p) => p.id == project.id ? p.copyWith(name: name) : p).toList();
+              await widget.onProjectsChanged(next);
+            }
+
+            Future<void> _editCode(AppProject project) async {
+              final source = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => CodeEditorScreen(title: 'Edit ${project.name}', initialText: project.dartCode, kind: 'dart')));
+              if (source == null) return;
+              final next = widget.projects.map((p) => p.id == project.id ? p.copyWith(dartCode: source) : p).toList();
+              await widget.onProjectsChanged(next);
+            }
+
+            Future<void> _delete(AppProject project) async {
+              final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Delete project?'),
+                content: Text('"${project.name}" will be removed from this device. The GitHub repository and previous build artifacts will not be deleted.'),
+                actions: [TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete'))],
+              ));
+              if (confirmed == true) await widget.onProjectsChanged(widget.projects.where((p) => p.id != project.id).toList());
+            }
+
+            Future<void> _settings() async {
+              await Navigator.of(context).push<void>(MaterialPageRoute(builder: (_) => SettingsScreen(
+                accounts: widget.accounts,
+                autoFailover: widget.autoFailover,
+                repository: widget.repository,
+                apiFactory: widget.apiFactory,
+                onAccountsChanged: widget.onAccountsChanged,
+                onFailoverChanged: widget.onFailoverChanged,
+                onRepositoryChanged: widget.onRepositoryChanged,
+              )));
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(
+                    title: const Text('Simple App Builder'),
+                    actions: [IconButton(tooltip: 'Settings and GitHub accounts', onPressed: _settings, icon: const Icon(Icons.settings_outlined))],
+                  ),
+                  body: widget.projects.isEmpty
+                      ? Center(child: Padding(padding: const EdgeInsets.all(28), child: Column(mainAxisSize: MainAxisSize.min, children: [
+                          Icon(Icons.phone_android_rounded, size: 72, color: Theme.of(context).colorScheme.primary),
+                          const SizedBox(height: 18),
+                          Text('Build your first app', style: Theme.of(context).textTheme.headlineSmall),
+                          const SizedBox(height: 8),
+                          const Text('Create a Flutter project, choose an icon, paste or import Dart code, then build and download a release APK through GitHub Actions.', textAlign: TextAlign.center),
+                          const SizedBox(height: 18),
+                          FilledButton.icon(onPressed: () => _openWizard(), icon: const Icon(Icons.add), label: const Text('Create project')),
+                        ])))
+                      : ListView(padding: const EdgeInsets.fromLTRB(12, 12, 12, 92), children: [
+                          Card(child: ListTile(leading: const Icon(Icons.cloud_done_outlined), title: Text(widget.repository.isEmpty ? 'Repository not configured' : widget.repository), subtitle: Text('${widget.accounts.length} GitHub account(s) · ${widget.autoFailover ? 'automatic failover on' : 'automatic failover off'}'), trailing: const Icon(Icons.chevron_right), onTap: _settings)),
+                          const SizedBox(height: 8),
+                          ...widget.projects.map((project) => Card(
+                            child: ListTile(
+                              leading: CircleAvatar(child: project.iconBase64 == null ? const Icon(Icons.phone_android) : ClipOval(child: Image.memory(base64Decode(project.iconBase64!), fit: BoxFit.cover, width: 44, height: 44))),
+                              title: Text(project.name, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              subtitle: Text(project.packageName, maxLines: 1, overflow: TextOverflow.ellipsis),
+                              onTap: () => _openWizard(project: project),
+                              trailing: PopupMenuButton<String>(
+                                tooltip: 'Manage project',
+                                onSelected: (value) {
+                                  if (value == 'build') _openWizard(project: project);
+                                  if (value == 'name') _rename(project);
+                                  if (value == 'code') _editCode(project);
+                                  if (value == 'delete') _delete(project);
+                                },
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(value: 'build', child: ListTile(dense: true, leading: Icon(Icons.rocket_launch_outlined), title: Text('Build / manage'))),
+                                  PopupMenuItem(value: 'name', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename'))),
+                                  PopupMenuItem(value: 'code', child: ListTile(dense: true, leading: Icon(Icons.code), title: Text('Edit Dart source'))),
+                                  PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete'))),
+                                ],
+                              ),
+                            ),
+                          )),
+                        ]),
+                  floatingActionButton: FloatingActionButton.extended(onPressed: () => _openWizard(), icon: const Icon(Icons.add), label: const Text('New project')),
+                );
+          }
+
+          class SettingsScreen extends StatefulWidget {
+            const SettingsScreen({
+              super.key,
+              required this.accounts,
+              required this.autoFailover,
+              required this.repository,
+              required this.apiFactory,
+              required this.onAccountsChanged,
+              required this.onFailoverChanged,
+              required this.onRepositoryChanged,
+            });
+
+            final List<GitHubAccount> accounts;
+            final bool autoFailover;
+            final String repository;
+            final GitHubApi Function() apiFactory;
+            final Future<void> Function(List<GitHubAccount>) onAccountsChanged;
+            final Future<void> Function(bool) onFailoverChanged;
+            final Future<void> Function(String) onRepositoryChanged;
+
+            @override
+            State<SettingsScreen> createState() => _SettingsScreenState();
+          }
+
+          class _SettingsScreenState extends State<SettingsScreen> {
+            late List<GitHubAccount> _accounts;
+            late bool _failover;
+            late final TextEditingController _repoController;
+            bool _busy = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _accounts = List<GitHubAccount>.from(widget.accounts);
+              _failover = widget.autoFailover;
+              _repoController = TextEditingController(text: widget.repository);
+            }
+
+            @override
+            void dispose() { _repoController.dispose(); super.dispose(); }
+
+            Future<void> _saveAccounts() async {
+              await widget.onAccountsChanged(_accounts);
+              if (mounted) setState(() {});
+            }
+
+            Future<void> _editAccount({GitHubAccount? existing}) async {
+              final username = TextEditingController(text: existing?.username ?? '');
+              final token = TextEditingController();
+              final result = await showDialog<Map<String, String>>(context: context, builder: (context) => AlertDialog(
+                title: Text(existing == null ? 'Add GitHub account' : 'Edit ${existing.username}'),
+                content: SizedBox(width: 440, child: Column(mainAxisSize: MainAxisSize.min, children: [
+                  TextField(controller: username, autocorrect: false, decoration: const InputDecoration(labelText: 'GitHub username')),
+                  const SizedBox(height: 12),
+                  TextField(controller: token, obscureText: true, autocorrect: false, enableSuggestions: false, decoration: InputDecoration(labelText: 'Personal access token', hintText: existing == null ? 'Required' : 'Leave blank to keep current token')),
+                ])),
+                actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, {'username': username.text.trim(), 'token': token.text.trim()}), child: const Text('Verify and save'))],
+              ));
+              username.dispose(); token.dispose();
+              if (result == null) return;
+              final newName = result['username'] ?? '';
+              final newToken = (result['token'] ?? '').isNotEmpty ? result['token']! : (existing?.token ?? '');
+              if (newName.isEmpty || newToken.isEmpty) { _snack('Username and token are required.'); return; }
+              setState(() => _busy = true);
+              final error = await verifyAccount(newName, newToken);
+              if (!mounted) return;
+              if (error != null) { setState(() => _busy = false); _snack(error); return; }
+              final replacement = GitHubAccount(username: newName, token: newToken);
+              final index = existing == null ? -1 : _accounts.indexWhere((a) => a.username.toLowerCase() == existing.username.toLowerCase());
+              final duplicate = _accounts.asMap().entries.any((entry) => entry.key != index && entry.value.username.toLowerCase() == newName.toLowerCase());
+              if (duplicate) { setState(() => _busy = false); _snack('That username is already configured.'); return; }
+              if (index >= 0) {
+                _accounts[index] = replacement;
+              } else {
+                _accounts.add(replacement);
+              }
+              await _saveAccounts();
+              if (mounted) setState(() => _busy = false);
+              _snack('GitHub account verified and saved securely.');
+            }
+
+            Future<void> _makePrimary(GitHubAccount account) async {
+              setState(() {
+                _accounts = [account, ..._accounts.where((a) => a.username.toLowerCase() != account.username.toLowerCase())];
+              });
+              await _saveAccounts();
+              _snack('${account.username} is now the primary account.');
+            }
+
+            Future<void> _remove(GitHubAccount account) async {
+              if (_accounts.length == 1) { _snack('Keep at least one GitHub account connected.'); return; }
+              final yes = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Remove account?'),
+                content: Text('Remove ${account.username} and its locally stored token from this device?'),
+                actions: [TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Remove'))],
+              ));
+              if (yes == true) {
+                _accounts.removeWhere((a) => a.username.toLowerCase() == account.username.toLowerCase());
+                await _saveAccounts();
+              }
+            }
+
+            Future<void> _editWorkflow() async {
+              if (_busy) return;
+              setState(() => _busy = true);
+              try {
+                final api = widget.apiFactory();
+                final branch = await api.defaultBranch();
+                final current = await api.readWorkflow(branch);
+                if (!mounted) return;
+                final edited = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => CodeEditorScreen(title: 'Edit build_apk.yml', initialText: current, kind: 'yaml')));
+                if (edited != null && edited != current) {
+                  await api.saveWorkflow(branch, edited);
+                  _snack('Workflow saved to the repository.');
+                }
+              } catch (error) {
+                _snack('Could not load/save workflow: $error');
+              } finally {
+                if (mounted) setState(() => _busy = false);
+              }
+            }
+
+            void _snack(String message) {
+              if (!mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+            }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: const Text('Settings')),
+                  body: ListView(padding: const EdgeInsets.all(16), children: [
+                    Text('GitHub repository', style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: 8),
+                    TextField(controller: _repoController, autocorrect: false, decoration: const InputDecoration(labelText: 'owner/repository', helperText: 'Usually set automatically when this APK is built by the workflow.')),
+                    const SizedBox(height: 8),
+                    Align(alignment: Alignment.centerLeft, child: FilledButton.tonal(onPressed: _busy ? null : () async {
+                      final value = _repoController.text.trim();
+                      if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(value)) { _snack('Enter repository as owner/repository.'); return; }
+                      await widget.onRepositoryChanged(value);
+                      _snack('Repository saved.');
+                    }, child: const Text('Save repository'))),
+                    const Divider(height: 32),
+                    Text('Accounts and security', style: Theme.of(context).textTheme.titleLarge),
+                    SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Auto failover / rate-limit switching'), subtitle: const Text('Retry authentication, rate-limit, and access failures using another saved account.'), value: _failover, onChanged: (value) async { setState(() => _failover = value); await widget.onFailoverChanged(value); }),
+                    ..._accounts.asMap().entries.map((entry) {
+                      final index = entry.key; final account = entry.value;
+                      return Card(child: ListTile(
+                        leading: Icon(index == 0 ? Icons.verified_user : Icons.person_outline),
+                        title: Text(account.username),
+                        subtitle: Text(index == 0 ? 'Primary account · token stored securely' : 'Secondary account · token stored securely'),
+                        onTap: () => _makePrimary(account),
+                        trailing: PopupMenuButton<String>(onSelected: (value) { if (value == 'primary') _makePrimary(account); if (value == 'edit') _editAccount(existing: account); if (value == 'remove') _remove(account); }, itemBuilder: (_) => const [
+                          PopupMenuItem(value: 'primary', child: Text('Set as primary')),
+                          PopupMenuItem(value: 'edit', child: Text('Edit account / token')),
+                          PopupMenuItem(value: 'remove', child: Text('Remove account')),
+                        ]),
+                      ));
+                    }),
+                    OutlinedButton.icon(onPressed: _busy ? null : () => _editAccount(), icon: const Icon(Icons.person_add_alt_1), label: const Text('Add another account')),
+                    const Divider(height: 32),
+                    Text('Build pipeline', style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: 8),
+                    const Text('The workflow editor opens the live file in your GitHub repository. Saving commits the YAML change to the default branch. The PAT needs repo and workflow scopes.'),
+                    const SizedBox(height: 10),
+                    FilledButton.tonalIcon(onPressed: _busy ? null : _editWorkflow, icon: const Icon(Icons.edit_note), label: Text(_busy ? 'Working…' : 'Edit .github/workflows/build_apk.yml')),
+                    const SizedBox(height: 18),
+                    const SelectableText('Security notes\n• Personal access tokens are stored using flutter_secure_storage; they are not stored in SharedPreferences.\n• Use an expiry date and revoke tokens you no longer need.\n• The APK source sent to GitHub is compiled by GitHub Actions. Never paste tokens or other secrets into Dart source code.'),
+                  ]),
+                );
+          }
+
+          class ProjectWizard extends StatefulWidget {
+            const ProjectWizard({
+              super.key,
+              required this.repository,
+              required this.apiFactory,
+              required this.onSaveProject,
+              this.existing,
+            });
+
+            final String repository;
+            final GitHubApi Function() apiFactory;
+            final Future<void> Function(AppProject project) onSaveProject;
+            final AppProject? existing;
+
+            @override
+            State<ProjectWizard> createState() => _ProjectWizardState();
+          }
+
+          class _ProjectWizardState extends State<ProjectWizard> {
+            late final TextEditingController _name;
+            late final TextEditingController _packageName;
+            late final String _projectId;
+            late String _dartCode;
+            Uint8List? _iconBytes;
+            int _step = 0;
+            bool _building = false;
+            String _status = '';
+            bool _saved = false;
+
+            @override
+            void initState() {
+              super.initState();
+              _projectId = widget.existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString();
+              _name = TextEditingController(text: widget.existing?.name ?? 'My Flutter App');
+              _packageName = TextEditingController(text: widget.existing?.packageName ?? 'com.example.myapp');
+              _dartCode = widget.existing?.dartCode ?? '';
+              if (widget.existing?.iconBase64 != null) {
+                try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
+              }
+              if (widget.existing != null) _step = 0;
+            }
+
+
+
+            @override
+            void dispose() { _name.dispose(); _packageName.dispose(); super.dispose(); }
+
+            AppProject _project() => AppProject(
+              id: _projectId,
+              name: _name.text.trim(),
+              packageName: _packageName.text.trim(),
+              dartCode: _dartCode,
+              iconBase64: _iconBytes == null ? null : base64Encode(_iconBytes!),
+            );
+
+            bool _validDetails() {
+              if (_name.text.trim().isEmpty || _name.text.trim().length > 60) { _message('Project name must be 1–60 characters.'); return false; }
+              if (!RegExp(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$').hasMatch(_packageName.text.trim())) {
+                _message('Package name must be lowercase reverse-DNS format, e.g. com.example.myapp.'); return false;
+              }
+              return true;
+            }
+
+            void _message(String message) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message))); }
+
+            Future<void> _pickIcon() async {
+              final picked = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: false, withData: true);
+              if (picked == null || picked.files.isEmpty) return;
+              final file = picked.files.single;
+              if (file.bytes == null) { _message('Could not read this image file. Try a PNG image.'); return; }
+              if (file.bytes!.length > 8 * 1024 * 1024) { _message('Choose an image smaller than 8 MB.'); return; }
+              setState(() => _iconBytes = file.bytes);
+            }
+
+            Future<void> _pickDartFile() async {
+              final picked = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: const ['dart'], allowMultiple: false, withData: true);
+              if (picked == null || picked.files.isEmpty) return;
+              final bytes = picked.files.single.bytes;
+              if (bytes == null) { _message('Could not read that file.'); return; }
+              setState(() => _dartCode = utf8.decode(bytes, allowMalformed: true));
+            }
+
+            Future<void> _editCode() async {
+              final edited = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => CodeEditorScreen(title: 'Edit main.dart', initialText: _dartCode, kind: 'dart')));
+              if (edited != null) setState(() => _dartCode = edited);
+            }
+
+            Future<void> _continue() async {
+              if (_building) return;
+              if (_step == 0 && !_validDetails()) return;
+              if (_step == 2) {
+                if (_dartCode.trim().isEmpty) { _message('Choose a Dart file or enter Dart source code.'); return; }
+                if (utf8.encode(_dartCode).length > 50000) { _message('Dart source is too large for a workflow_dispatch input (maximum 50 KB).'); return; }
+              }
+              if (_step < 3) {
+                setState(() => _step++);
+                return;
+              }
+              await _buildAndDownload();
+            }
+
+            Future<void> _buildAndDownload() async {
+              if (!_validDetails()) return;
+              if (widget.repository.isEmpty) { _message('Repository is not configured. Open Settings.'); return; }
+              if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(widget.repository)) { _message('Repository should be owner/repository.'); return; }
+              if (_dartCode.trim().isEmpty || utf8.encode(_dartCode).length > 50000) { _message('Enter valid Dart source smaller than 50 KB.'); return; }
+              setState(() { _building = true; _status = 'Saving project…'; });
+              try {
+                await widget.onSaveProject(_project());
+                _saved = true;
+                final api = widget.apiFactory();
+                _setStatus('Checking repository and default branch…');
+                final branch = await api.defaultBranch();
+                final payloadSize = utf8.encode(jsonEncode({
+                  'ref': branch,
+                  'inputs': {'project_name': _name.text.trim(), 'package_name': _packageName.text.trim(), 'dart_code': _dartCode},
+                })).length;
+                if (payloadSize > 60000) throw Exception('The workflow input payload is too large after JSON encoding. Shorten the Dart source and retry.');
+                if (_iconBytes != null) {
+                  _setStatus('Uploading icon.png to the repository…');
+                  await api.uploadRootIcon(branch, _iconBytes!);
+                }
+                final previousRunNumber = await api.latestWorkflowRunNumber();
+                _setStatus('Triggering GitHub Actions…');
+                await api.dispatchBuild(branch: branch, projectName: _name.text.trim(), packageName: _packageName.text.trim(), dartCode: _dartCode);
+                final run = await api.waitForBuild(previousRunNumber, _setStatus);
+                _setStatus('Build passed. Downloading APK artifact…');
+                final zip = await api.downloadGeneratedApk((run['id'] ?? '').toString());
+                final archive = ZipDecoder().decodeBytes(zip);
+                ArchiveFile? apk;
+                for (final file in archive.files) {
+                  if (file.isFile && file.name.toLowerCase().endsWith('.apk')) { apk = file; break; }
+                }
+                if (apk == null) throw Exception('The artifact ZIP did not contain an APK file.');
+                final apkBytes = Uint8List.fromList(apk.content as List<int>);
+                final safeName = _name.text.trim().replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
+                final output = await FilePicker.platform.saveFile(
+                  dialogTitle: 'Save your release APK',
+                  fileName: '${safeName.isEmpty ? 'generated_app' : safeName}.apk',
+                  type: FileType.custom,
+                  allowedExtensions: const ['apk'],
+                  bytes: apkBytes,
+                );
+                if (!mounted) return;
+                if (output == null) {
+                  setState(() => _status = 'Build succeeded. APK download was canceled in the save dialog.');
+                } else {
+                  setState(() => _status = 'Build succeeded. APK saved to:\n$output');
+                }
+                _message(output == null ? 'Build succeeded; save dialog was canceled.' : 'Release APK downloaded successfully.');
+              } catch (error) {
+                if (mounted) setState(() => _status = 'Build failed:\n$error');
+                _message('Build failed. See the status below for details.');
+              } finally {
+                if (mounted) setState(() => _building = false);
+              }
+            }
+
+            void _setStatus(String message) { if (mounted) setState(() => _status = message); }
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  appBar: AppBar(title: Text(widget.existing == null ? 'Create project' : 'Build ${widget.existing!.name}')),
+                  body: Stepper(
+                    type: StepperType.vertical,
+                    currentStep: _step,
+                    onStepTapped: _building ? null : (step) => setState(() => _step = step),
+                    onStepContinue: _continue,
+                    onStepCancel: _building ? null : () { if (_step > 0) setState(() => _step--); else Navigator.pop(context); },
+                    controlsBuilder: (context, details) => Padding(
+                      padding: const EdgeInsets.only(top: 16),
+                      child: Row(children: [
+                        FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build and download APK') : 'Continue')),
+                        const SizedBox(width: 10),
+                        if (!_building) TextButton(onPressed: details.onStepCancel, child: Text(_step == 0 ? 'Cancel' : 'Back')),
+                      ]),
+                    ),
+                    steps: [
+                      Step(title: const Text('Project details'), subtitle: const Text('Name and Android package ID'), isActive: _step >= 0, state: _step > 0 ? StepState.complete : StepState.indexed, content: Column(children: [
+                        TextField(controller: _name, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'My Company App')),
+                        const SizedBox(height: 12),
+                        TextField(controller: _packageName, autocorrect: false, decoration: const InputDecoration(labelText: 'Package name', hintText: 'com.company.myapp', helperText: 'Use lowercase reverse-DNS format with at least three segments.')),
+                      ])),
+                      Step(title: const Text('App logo'), subtitle: const Text('Optional icon.png'), isActive: _step >= 1, state: _step > 1 ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        const Text('Select a square PNG or other supported image. It will be uploaded as the repository root icon.png and generated into Android launcher icon sizes.'),
+                        const SizedBox(height: 14),
+                        if (_iconBytes != null) Center(child: ClipRRect(borderRadius: BorderRadius.circular(18), child: Image.memory(_iconBytes!, width: 112, height: 112, fit: BoxFit.cover))) else const Center(child: Icon(Icons.image_outlined, size: 80)),
+                        const SizedBox(height: 10),
+                        Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() => _iconBytes = null), icon: const Icon(Icons.delete_outline))]),
+                      ])),
+                      Step(title: const Text('Dart source'), subtitle: const Text('Import a .dart file or edit code'), isActive: _step >= 2, state: _step > 2 ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text('${_dartCode.split('\n').length} lines · ${utf8.encode(_dartCode).length} bytes'),
+                        const SizedBox(height: 10),
+                        OutlinedButton.icon(onPressed: _pickDartFile, icon: const Icon(Icons.file_open), label: const Text('Choose .dart file (renamed to main.dart)')),
+                        const SizedBox(height: 8),
+                        FilledButton.tonalIcon(onPressed: _editCode, icon: const Icon(Icons.code), label: const Text('Open syntax-highlighting editor')),
+                        const SizedBox(height: 10),
+                        Container(width: double.infinity, constraints: const BoxConstraints(maxHeight: 180), padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(12)), child: SingleChildScrollView(child: SelectableText(_dartCode, maxLines: 14, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)))),
+                      ])),
+                      Step(title: const Text('Build and download'), subtitle: const Text('GitHub Actions release build'), isActive: _step >= 3, state: _status.startsWith('Build succeeded') ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                        Text('Target repository: ${widget.repository.isEmpty ? '(not configured)' : widget.repository}'),
+                        const SizedBox(height: 8),
+                        const Text('The workflow creates a fresh Flutter project, installs dependencies referenced by package: imports, applies the launcher icon, and runs flutter build apk --release. The builder APK is uploaded as a separate artifact too.'),
+                        if (_status.isNotEmpty) ...[
+                          const SizedBox(height: 16),
+                          if (_building) const LinearProgressIndicator(),
+                          const SizedBox(height: 8),
+                          SelectableText(_status),
+                        ],
+                      ])),
+                    ],
+                  ),
+                );
+          }
+
+          class CodeEditorScreen extends StatefulWidget {
+            const CodeEditorScreen({super.key, required this.title, required this.initialText, required this.kind});
+            final String title;
+            final String initialText;
+            final String kind;
+
+            @override
+            State<CodeEditorScreen> createState() => _CodeEditorScreenState();
+          }
+
+          class _CodeEditorScreenState extends State<CodeEditorScreen> {
+            late final CodeController _controller;
+
+            @override
+            void initState() {
+              super.initState();
+              _controller = CodeController(
+                text: widget.initialText,
+                language: widget.kind == 'yaml' ? yaml_language.yaml : dart_language.dart,
+              );
+            }
+
+            @override
+            void dispose() { _controller.dispose(); super.dispose(); }
+
+            @override
+            Widget build(BuildContext context) {
+              final dark = Theme.of(context).brightness == Brightness.dark;
+              return Scaffold(
+                appBar: AppBar(title: Text(widget.title), actions: [IconButton(tooltip: 'Save changes', onPressed: () => Navigator.pop(context, _controller.text), icon: const Icon(Icons.check))]),
+                body: CodeTheme(
+                  data: CodeThemeData(styles: dark ? monokaiSublimeTheme : githubTheme),
+                  child: CodeField(
+                    controller: _controller,
+                    expands: true,
+                    wrap: false,
+                    padding: const EdgeInsets.all(16),
+                    textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45),
+                    gutterStyle: GutterStyle(showLineNumbers: true, showErrors: false, showFoldingHandles: true, width: 54, margin: 12),
+                  ),
+                ),
+              );
+            }
+          }
+          DART
+          flutter pub get
+          flutter build apk --release --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/simple-app-builder.apk"
+
+      # Upload the builder first so it remains available even when a user's app has a
+      # Dart compile error later in the same run.
+      - name: Upload Simple App Builder APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-app-builder-${{ github.run_number }}
+          path: dist/simple-app-builder.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Create the requested Flutter project and install source dependencies
+        shell: bash
+        env:
+          PROJECT_NAME: ${{ inputs.project_name }}
+          PACKAGE_NAME: ${{ inputs.package_name }}
+          DART_CODE: ${{ inputs.dart_code }}
+        run: |
+          set -euo pipefail
+          TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
+          ORG="${PACKAGE_NAME%.*}"
+          APP_SLUG="${PACKAGE_NAME##*.}"
+          flutter create --org "$ORG" --project-name "$APP_SLUG" "$TARGET_DIR"
+          printf '%s' "$DART_CODE" > "$TARGET_DIR/lib/main.dart"
+          python3 "$RUNNER_TEMP/patch_android_project.py" "$TARGET_DIR" "$PROJECT_NAME" "$PACKAGE_NAME"
+
+          # The workflow input contains main.dart rather than a second pubspec. Detect
+          # package: imports and add the corresponding pub.dev dependencies automatically.
+          python3 - "$TARGET_DIR/lib/main.dart" > "$RUNNER_TEMP/target_dependencies.txt" <<'PY'
+          import re, sys
+          source = open(sys.argv[1], encoding='utf-8').read()
+          packages = sorted(set(re.findall(r"package:([A-Za-z][A-Za-z0-9_]*)/", source)))
+          ignored = {'flutter', 'flutter_test', 'integration_test'}
+          for package in packages:
+              if package not in ignored and re.fullmatch(r'[a-z][a-z0-9_]*', package):
+                  print(package)
+          PY
+          mapfile -t EXTRA_DEPENDENCIES < "$RUNNER_TEMP/target_dependencies.txt"
+          cd "$TARGET_DIR"
+          if ((${#EXTRA_DEPENDENCIES[@]})); then
+            echo "Installing detected Dart package dependencies: ${EXTRA_DEPENDENCIES[*]}"
+            flutter pub add "${EXTRA_DEPENDENCIES[@]}"
+          fi
+          flutter pub get
+
+      - name: Apply root icon.png as Android launcher icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
+          if [[ -f "$GITHUB_WORKSPACE/icon.png" ]]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y imagemagick
+            identify "$GITHUB_WORKSPACE/icon.png" >/dev/null
+            RES="$TARGET_DIR/android/app/src/main/res"
+            while IFS=: read -r density size; do
+              mkdir -p "$RES/mipmap-$density"
+              # Standard bitmap launcher icons for each density.
+              convert "$GITHUB_WORKSPACE/icon.png" -auto-orient -strip -resize "${size}x${size}^" -gravity center -extent "${size}x${size}" "$RES/mipmap-$density/ic_launcher.png"
+              cp "$RES/mipmap-$density/ic_launcher.png" "$RES/mipmap-$density/ic_launcher_round.png"
+              # Android adaptive icons reference this foreground resource on API 26+.
+              foreground_size=$((size * 68 / 100))
+              convert "$GITHUB_WORKSPACE/icon.png" -auto-orient -strip -resize "${foreground_size}x${foreground_size}" -gravity center -background none -extent "${size}x${size}" "$RES/mipmap-$density/ic_launcher_foreground.png"
+            done <<'SIZES'
+          mdpi:48
+          hdpi:72
+          xhdpi:96
+          xxhdpi:144
+          xxxhdpi:192
+          SIZES
+            echo 'Applied repository icon.png to Android launcher icon resources.'
+          else
+            echo 'No root icon.png found; keeping Flutter default launcher icons.'
+          fi
+
+      - name: Build generated release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/generated_flutter_app"
+          flutter build apk --release
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.apk"
+
+      - name: Upload generated release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: generated-apk-${{ steps.metadata.outputs.slug }}
+          path: dist/${{ steps.metadata.outputs.slug }}-release.apk
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
