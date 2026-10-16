@@ -51,6 +51,7 @@ jobs:
               'dynamic_themed_icon': payload.get('dynamic_themed_icon', options.get('dynamic_themed_icon', True)),
               'build_format': payload.get('build_format', options.get('build_format', 'apk')),
               'sign_release': payload.get('sign_release', options.get('sign_release', False)),
+              'app_version': payload.get('app_version', options.get('app_version', options.get('version', payload.get('version', '1.0.0+1')))),
               'request_id': payload.get('request_id', ''),
           }
           output_path = Path(os.environ['GITHUB_OUTPUT'])
@@ -85,6 +86,7 @@ jobs:
           DYNAMIC_THEMED_ICON: ${{ steps.app_payload.outputs.dynamic_themed_icon }}
           BUILD_FORMAT: ${{ steps.app_payload.outputs.build_format }}
           SIGN_RELEASE: ${{ steps.app_payload.outputs.sign_release }}
+          APP_VERSION: ${{ steps.app_payload.outputs.app_version }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -99,6 +101,12 @@ jobs:
               sys.exit('project_name must be 1–60 characters and contain no control characters.')
           if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}', package):
               sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
+          app_version = os.environ.get('APP_VERSION', '').strip() or '1.0.0+1'
+          version_match = re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\+([1-9]\d*)', app_version)
+          if not version_match:
+              sys.exit('app_version must use major.minor.patch+buildNumber format, e.g. 1.2.0+5.')
+          if int(version_match.group(4)) > 2100000000:
+              sys.exit('app_version buildNumber must be <= 2100000000 for Android versionCode.')
           # This validator runs only for app-created repository_dispatch events.
           # Manual workflow_dispatch builds the builder APK and has no project inputs.
           source_zip = Path('.simple-app-builder/source.zip')
@@ -226,6 +234,23 @@ jobs:
           project = Path(sys.argv[1])
           app_label = sys.argv[2]
           application_id = sys.argv[3]
+          app_version = sys.argv[4] if len(sys.argv) > 4 else '1.0.0+1'
+          if not re.fullmatch(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\+([1-9]\d*)', app_version):
+              raise SystemExit('app_version must use major.minor.patch+buildNumber format, e.g. 1.2.0+5.')
+          if int(app_version.rsplit('+', 1)[1]) > 2100000000:
+              raise SystemExit('app_version buildNumber must be <= 2100000000 for Android versionCode.')
+          pubspec = project / 'pubspec.yaml'
+          if pubspec.is_file():
+              pub_text = pubspec.read_text(encoding='utf-8')
+              pub_text, count = re.subn(r'(?m)^version\s*:\s*.*$', f'version: {app_version}', pub_text, count=1)
+              if count == 0:
+                  name_match = re.search(r'(?m)^name\s*:', pub_text)
+                  if not name_match:
+                      raise SystemExit('Could not locate the name field in generated pubspec.yaml to set the project version.')
+                  end = pub_text.find('\n', name_match.start())
+                  end = len(pub_text) if end < 0 else end + 1
+                  pub_text = pub_text[:end] + f'version: {app_version}\n' + pub_text[end:]
+              pubspec.write_text(pub_text, encoding='utf-8')
           manifest = project / 'android/app/src/main/AndroidManifest.xml'
           android_ns = 'http://schemas.android.com/apk/res/android'
           ET.register_namespace('android', android_ns)
@@ -542,6 +567,7 @@ jobs:
               required this.id,
               required this.name,
               required this.packageName,
+              this.version = '1.0.0+1',
               required this.dartCode,
               this.additionalFiles = const {},
               this.folders = const <String>{},
@@ -558,6 +584,7 @@ jobs:
             final String id;
             final String name;
             final String packageName;
+            final String version;
             // Keep dartCode as the main entry point for migration compatibility.
             final String dartCode;
             // Keys are full relative paths, such as lib/screens/home_screen.dart.
@@ -577,6 +604,7 @@ jobs:
             AppProject copyWith({
               String? name,
               String? packageName,
+              String? version,
               String? dartCode,
               Map<String, String>? additionalFiles,
               Set<String>? folders,
@@ -593,6 +621,7 @@ jobs:
                   id: id,
                   name: name ?? this.name,
                   packageName: packageName ?? this.packageName,
+                  version: version ?? this.version,
                   dartCode: dartCode ?? this.dartCode,
                   additionalFiles: additionalFiles ?? this.additionalFiles,
                   folders: folders ?? this.folders,
@@ -610,6 +639,7 @@ jobs:
                   'id': id,
                   'name': name,
                   'packageName': packageName,
+                  'version': version,
                   'dartCode': dartCode,
                   'additionalFiles': additionalFiles,
                   'folders': folders.toList()..sort(),
@@ -648,6 +678,7 @@ jobs:
                 id: (json['id'] ?? DateTime.now().microsecondsSinceEpoch).toString(),
                 name: (json['name'] ?? 'Untitled app').toString(),
                 packageName: (json['packageName'] ?? 'com.example.myapp').toString(),
+                version: (json['version'] ?? '1.0.0+1').toString(),
                 dartCode: (json['dartCode'] ?? '').toString(),
                 additionalFiles: files,
                 folders: folders,
@@ -1593,6 +1624,7 @@ jobs:
               required String requestId,
               String buildFormat = 'apk',
               bool signRelease = false,
+              String appVersion = '1.0.0+1',
             }) async {
               // repository_dispatch keeps project fields out of GitHub's static
               // "Run workflow" form. The mobile app sends a different payload per build.
@@ -1606,10 +1638,13 @@ jobs:
                   'android_dependencies': androidDependencies,
                   'has_custom_icon': hasCustomIcon,
                   'icon_path': iconPath,
-                  'dynamic_themed_icon': dynamicThemedIcon,
-                  'build_format': buildFormat,
-                  'sign_release': signRelease,
                   'request_id': requestId,
+                  'options': {
+                    'dynamic_themed_icon': dynamicThemedIcon,
+                    'build_format': buildFormat,
+                    'sign_release': signRelease,
+                    'app_version': appVersion,
+                  },
                 },
               });
               if (response.statusCode != 204 && response.statusCode != 201) {
@@ -1933,6 +1968,7 @@ jobs:
             List<AppProject> _projects = [];
             bool _autoFailover = true;
             String _repository = compiledRepository;
+            int _backupIntervalMinutes = 15;
             Map<String, String> _backupRepositories = <String, String>{};
             Timer? _backupTimer;
             Timer? _backupDebounce;
@@ -1947,8 +1983,16 @@ jobs:
             void initState() {
               super.initState();
               WidgetsBinding.instance.addObserver(this);
+              _configureBackupTimer();
               _loadState();
-              _backupTimer = Timer.periodic(const Duration(minutes: 15), (_) {
+            }
+
+            static const List<int> _supportedBackupIntervals = <int>[5, 10, 15, 30, 60, 360];
+
+            void _configureBackupTimer() {
+              _backupTimer?.cancel();
+              if (!_supportedBackupIntervals.contains(_backupIntervalMinutes)) _backupIntervalMinutes = 15;
+              _backupTimer = Timer.periodic(Duration(minutes: _backupIntervalMinutes), (_) {
                 unawaited(_synchronizeBackups(restoreCloud: false));
               });
             }
@@ -2002,6 +2046,9 @@ jobs:
                 }
               } catch (_) { _backupRepositories = <String, String>{}; }
               _autoFailover = prefs.getBool('auto_failover') ?? true;
+              final savedInterval = prefs.getInt('backup_interval_minutes') ?? 15;
+              _backupIntervalMinutes = _supportedBackupIntervals.contains(savedInterval) ? savedInterval : 15;
+              _configureBackupTimer();
               _repository = normalizeRepository(prefs.getString('repository') ?? compiledRepository);
               if (mounted) setState(() => _ready = true);
               if (_accounts.isNotEmpty) unawaited(_synchronizeBackups(restoreCloud: true));
@@ -2162,7 +2209,7 @@ jobs:
                       final excerpt = backupErrors.take(3).join(' | ');
                       _backupStatus = 'Backups configured · ${accountRepositories.length} account(s) · $names. Some items need attention: $excerpt';
                     } else {
-                      _backupStatus = 'Automatic backup active · ${accountRepositories.length} account(s) · $names · syncs on changes and every 15 minutes.';
+                      _backupStatus = 'Automatic backup active · ${accountRepositories.length} account(s) · $names · syncs on changes and every $_backupIntervalMinutes minute(s) while the app is active.';
                     }
                   });
                 }
@@ -2188,6 +2235,16 @@ jobs:
               final prefs = await SharedPreferences.getInstance();
               await prefs.setBool('auto_failover', enabled);
               if (mounted) setState(() {});
+            }
+
+            Future<void> _saveBackupInterval(int minutes) async {
+              if (!_supportedBackupIntervals.contains(minutes)) return;
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setInt('backup_interval_minutes', minutes);
+              _backupIntervalMinutes = minutes;
+              _configureBackupTimer();
+              if (mounted) setState(() => _backupStatus = 'Backup frequency updated: every $minutes minute(s) while the app is active.');
+              _scheduleBackupSync();
             }
           
             Future<void> _saveRepository(String repository) async {
@@ -2253,11 +2310,13 @@ jobs:
                                   autoFailover: _autoFailover,
                                   repository: _repository,
                                   backupStatus: _backupStatus,
+                                  backupIntervalMinutes: _backupIntervalMinutes,
                                   apiFactory: _api,
                                   onAccountsChanged: _saveAccounts,
                                   onProjectsChanged: _saveProjects,
                                   onFailoverChanged: _saveFailover,
                                   onRepositoryChanged: _saveRepository,
+                                  onBackupIntervalChanged: _saveBackupInterval,
                                 ),
                     );
                   },
@@ -2292,7 +2351,7 @@ jobs:
             static const List<_GuideArticle> _articles = <_GuideArticle>[
               _GuideArticle(title: '1. Start here: create your first app', summary: 'A complete first-run walkthrough from project name to installed APK.', icon: Icons.rocket_launch_outlined, steps: <String>[
                 'Connect a GitHub account first. The account is used to create a private repository, save the project source, start builds, and download build artifacts.',
-                'Tap New project. Enter a display name such as My Notes and an Android application ID such as com.example.mynotes. Use lowercase reverse-domain segments with no spaces.',
+                'Tap New project. Enter a display name such as My Notes, an Android application ID such as com.example.mynotes, and an app version such as 1.0.0+1. The part after + is the Android build number; increase it for each store release. Use lowercase reverse-domain segments with no spaces in the application ID.',
                 'Choose an optional launcher image. The image is preserved; no background-removal algorithm is run. An opaque image gets a white canvas so the icon does not unexpectedly turn black.',
                 'Open Dart project files. Pick a starter template, keep the existing project, or import a Dart file, folder, or ZIP. The entry point must be lib/main.dart.',
                 'Edit files by tapping them in the folder browser. Changes are saved as a draft automatically, but check that the latest edit appears before starting a build.',
@@ -2362,7 +2421,7 @@ jobs:
               ]),
               _GuideArticle(title: '10. Automatic backups and private repositories', summary: 'Where projects are saved and how restoration works.', icon: Icons.backup_outlined, steps: <String>[
                 'The app stores the project list on the device and stores GitHub tokens using secure storage. Project source is synchronized to private GitHub repositories associated with the connected account.',
-                'Backup sync is scheduled after changes, periodically while the app is active, and when the app resumes. Android may suspend timers while the app is backgrounded or closed; this is not a guaranteed always-running service.',
+                'Backup sync is scheduled after changes, at the interval selected in Settings while the app is active, and when the app resumes. Android may suspend timers while the app is backgrounded or closed; this is not a guaranteed always-running service.',
                 'Do not make a backup repository public. Source archives can include proprietary code, endpoints, or other material you should not expose.',
                 'When adding a second account, the app can maintain a separate backup repository for that account. Ensure the account has sufficient repository permissions before relying on the backup.',
                 'If a project is missing, check the backup status on the home screen, the connected account, and the backup repository in GitHub before deleting local data.',
@@ -2540,11 +2599,13 @@ jobs:
               required this.autoFailover,
               required this.repository,
               required this.backupStatus,
+              required this.backupIntervalMinutes,
               required this.apiFactory,
               required this.onAccountsChanged,
               required this.onProjectsChanged,
               required this.onFailoverChanged,
               required this.onRepositoryChanged,
+              required this.onBackupIntervalChanged,
             });
           
             final List<GitHubAccount> accounts;
@@ -2552,11 +2613,13 @@ jobs:
             final bool autoFailover;
             final String repository;
             final String backupStatus;
+            final int backupIntervalMinutes;
             final GitHubApi Function() apiFactory;
             final Future<void> Function(List<GitHubAccount>) onAccountsChanged;
             final Future<void> Function(List<AppProject>) onProjectsChanged;
             final Future<void> Function(bool) onFailoverChanged;
             final Future<void> Function(String) onRepositoryChanged;
+            final Future<void> Function(int) onBackupIntervalChanged;
           
             @override
             State<DashboardScreen> createState() => _DashboardScreenState();
@@ -2615,10 +2678,12 @@ jobs:
                 accounts: widget.accounts,
                 autoFailover: widget.autoFailover,
                 repository: widget.repository,
+                backupIntervalMinutes: widget.backupIntervalMinutes,
                 apiFactory: widget.apiFactory,
                 onAccountsChanged: widget.onAccountsChanged,
                 onFailoverChanged: widget.onFailoverChanged,
                 onRepositoryChanged: widget.onRepositoryChanged,
+                onBackupIntervalChanged: widget.onBackupIntervalChanged,
               )));
             }
           
@@ -2654,7 +2719,7 @@ jobs:
                             child: ListTile(
                               leading: CircleAvatar(backgroundColor: Colors.white, child: project.iconBase64 == null ? const Icon(Icons.phone_android, color: Colors.black54) : ClipOval(child: Image.memory(base64Decode(project.iconBase64!), fit: BoxFit.contain, width: 44, height: 44))),
                               title: Text(project.name, maxLines: 1, overflow: TextOverflow.ellipsis),
-                              subtitle: Text(project.repository.isNotEmpty ? '${project.packageName} · ${project.repository}' : project.packageName, maxLines: 2, overflow: TextOverflow.ellipsis),
+                              subtitle: Text('${project.packageName} · v${project.version}${project.repository.isNotEmpty ? ' · ${project.repository}' : ''}', maxLines: 2, overflow: TextOverflow.ellipsis),
                               onTap: () => _openWizard(project: project),
                               trailing: PopupMenuButton<String>(
                                 tooltip: 'Manage project',
@@ -2684,19 +2749,23 @@ jobs:
               required this.accounts,
               required this.autoFailover,
               required this.repository,
+              required this.backupIntervalMinutes,
               required this.apiFactory,
               required this.onAccountsChanged,
               required this.onFailoverChanged,
               required this.onRepositoryChanged,
+              required this.onBackupIntervalChanged,
             });
           
             final List<GitHubAccount> accounts;
             final bool autoFailover;
             final String repository;
+            final int backupIntervalMinutes;
             final GitHubApi Function() apiFactory;
             final Future<void> Function(List<GitHubAccount>) onAccountsChanged;
             final Future<void> Function(bool) onFailoverChanged;
             final Future<void> Function(String) onRepositoryChanged;
+            final Future<void> Function(int) onBackupIntervalChanged;
           
             @override
             State<SettingsScreen> createState() => _SettingsScreenState();
@@ -2705,6 +2774,7 @@ jobs:
           class _SettingsScreenState extends State<SettingsScreen> {
             late List<GitHubAccount> _accounts;
             late bool _failover;
+            late int _backupIntervalMinutes;
             late final TextEditingController _repoController;
             bool _busy = false;
           
@@ -2713,6 +2783,7 @@ jobs:
               super.initState();
               _accounts = List<GitHubAccount>.from(widget.accounts);
               _failover = widget.autoFailover;
+              _backupIntervalMinutes = <int>[5, 10, 15, 30, 60, 360].contains(widget.backupIntervalMinutes) ? widget.backupIntervalMinutes : 15;
               _repoController = TextEditingController(text: widget.repository);
             }
           
@@ -2863,6 +2934,36 @@ jobs:
                     const SizedBox(height: 8),
                     Align(alignment: Alignment.centerLeft, child: FilledButton.tonal(onPressed: _busy ? null : _saveRepositorySetting, child: const Text('Verify and save repository'))),
                     const Divider(height: 32),
+                    Text('Automatic backups', style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: 8),
+                    DropdownButtonFormField<int>(
+                      value: _backupIntervalMinutes,
+                      decoration: const InputDecoration(
+                        labelText: 'Backup frequency',
+                        helperText: 'Backups also run after changes and when the app resumes. Periodic backups run only while the app is active; Android may suspend timers in the background.',
+                      ),
+                      items: const <DropdownMenuItem<int>>[
+                        DropdownMenuItem(value: 5, child: Text('Every 5 minutes (more frequent API use)')),
+                        DropdownMenuItem(value: 10, child: Text('Every 10 minutes')),
+                        DropdownMenuItem(value: 15, child: Text('Every 15 minutes (recommended)')),
+                        DropdownMenuItem(value: 30, child: Text('Every 30 minutes')),
+                        DropdownMenuItem(value: 60, child: Text('Every hour')),
+                        DropdownMenuItem(value: 360, child: Text('Every 6 hours')),
+                      ],
+                      onChanged: _busy ? null : (value) async {
+                        if (value == null || value == _backupIntervalMinutes) return;
+                        final previous = _backupIntervalMinutes;
+                        setState(() => _backupIntervalMinutes = value);
+                        try {
+                          await widget.onBackupIntervalChanged(value);
+                          _snack('Backup frequency saved: every $value minute(s) while the app is active.');
+                        } catch (error) {
+                          if (mounted) setState(() => _backupIntervalMinutes = previous);
+                          _snack('Could not save backup frequency: $error');
+                        }
+                      },
+                    ),
+                    const Divider(height: 32),
                     Text('Accounts and security', style: Theme.of(context).textTheme.titleLarge),
                     SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Auto failover / rate-limit switching'), subtitle: const Text('Retry authentication, rate-limit, and access failures using another saved account.'), value: _failover, onChanged: (value) async { setState(() => _failover = value); await widget.onFailoverChanged(value); }),
                     ..._accounts.asMap().entries.map((entry) {
@@ -2916,6 +3017,7 @@ jobs:
           class _ProjectWizardState extends State<ProjectWizard> {
             late final TextEditingController _name;
             late final TextEditingController _packageName;
+            late final TextEditingController _version;
             late final TextEditingController _dependencies;
             late final TextEditingController _androidDependencies;
             late final TextEditingController _repositoryName;
@@ -3007,10 +3109,12 @@ jobs:
               _projectId = widget.existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString();
               _name = TextEditingController(text: widget.existing?.name ?? 'My Flutter App');
               _packageName = TextEditingController(text: widget.existing?.packageName ?? 'com.example.myapp');
+              _version = TextEditingController(text: widget.existing?.version ?? '1.0.0+1');
               _dependencies = TextEditingController(text: widget.existing?.dependencies ?? '');
               _androidDependencies = TextEditingController(text: widget.existing?.androidDependencies ?? '');
               _name.addListener(_scheduleDraftSave);
               _packageName.addListener(_scheduleDraftSave);
+              _version.addListener(_scheduleDraftSave);
               _dependencies.addListener(_scheduleDraftSave);
               _androidDependencies.addListener(_scheduleDraftSave);
               final savedTargetRepository = normalizeRepository(widget.existing?.repository ?? '');
@@ -3066,11 +3170,13 @@ jobs:
               _draftSaveTimer?.cancel();
               _name.removeListener(_scheduleDraftSave);
               _packageName.removeListener(_scheduleDraftSave);
+              _version.removeListener(_scheduleDraftSave);
               _dependencies.removeListener(_scheduleDraftSave);
               _androidDependencies.removeListener(_scheduleDraftSave);
               if (_name.text.trim().isNotEmpty) unawaited(widget.onSaveProject(_project()));
               _name.dispose();
               _packageName.dispose();
+              _version.dispose();
               _dependencies.dispose();
               _androidDependencies.dispose();
               _repositoryName.dispose();
@@ -3081,6 +3187,7 @@ jobs:
               id: _projectId,
               name: _name.text.trim(),
               packageName: _packageName.text.trim(),
+              version: _version.text.trim().isEmpty ? '1.0.0+1' : _version.text.trim(),
               dartCode: _dartCode,
               additionalFiles: Map<String, String>.from(_additionalFiles),
               dependencies: _dependencies.text.trim(),
@@ -3105,6 +3212,13 @@ jobs:
               }
               if (!RegExp(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$').hasMatch(_packageName.text.trim())) {
                 _message('Package name must be lowercase reverse-DNS format, e.g. com.example.myapp.');
+                return false;
+              }
+              final version = _version.text.trim();
+              final versionMatch = RegExp(r'^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)\+([1-9]\d*)$').firstMatch(version);
+              final buildNumber = versionMatch == null ? null : int.tryParse(versionMatch.group(4)!);
+              if (versionMatch == null || buildNumber == null || buildNumber > 2100000000) {
+                _message('Version must use major.minor.patch+buildNumber, e.g. 1.2.0+5. The build number must be 1–2100000000.');
                 return false;
               }
               final savedRepository = _targetRepository;
@@ -4047,10 +4161,13 @@ jobs:
                     'android_dependencies': _androidDependencies.text.trim(),
                     'has_custom_icon': hasCustomIcon,
                     'icon_path': iconPath,
-                    'dynamic_themed_icon': _dynamicThemedIcon,
-                    'build_format': outputFormat,
-                    'sign_release': _signRelease,
                     'request_id': requestId,
+                    'options': {
+                      'dynamic_themed_icon': _dynamicThemedIcon,
+                      'build_format': outputFormat,
+                      'sign_release': _signRelease,
+                      'app_version': _version.text.trim(),
+                    },
                   },
                 })).length;
                 if (payloadSize > 60000) throw Exception('The GitHub event payload is too large after JSON encoding. Reduce project source size or dependency list.');
@@ -4074,6 +4191,7 @@ jobs:
                   requestId: requestId,
                   buildFormat: outputFormat,
                   signRelease: _signRelease,
+                  appVersion: _version.text.trim(),
                 );
                 final run = await targetApi!.waitForBuild(
                   requestId,
@@ -4307,6 +4425,17 @@ jobs:
                       TextField(controller: _name, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'My Company App')),
                       const SizedBox(height: 12),
                       TextField(controller: _packageName, autocorrect: false, decoration: const InputDecoration(labelText: 'Package name', hintText: 'com.company.myapp', helperText: 'Use lowercase reverse-DNS format with at least three segments.')),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _version,
+                        autocorrect: false,
+                        keyboardType: TextInputType.text,
+                        decoration: const InputDecoration(
+                          labelText: 'App version',
+                          hintText: '1.0.0+1',
+                          helperText: 'Use major.minor.patch+buildNumber, e.g. 1.2.0+5. Increase the build number for each store release.',
+                        ),
+                      ),
                       const SizedBox(height: 12),
                       TextField(
                         controller: _repositoryName,
@@ -4657,6 +4786,7 @@ jobs:
           SOURCE_ARCHIVE_PATH: ${{ github.workspace }}/.simple-app-builder/source.zip
           DEPENDENCIES: ${{ steps.app_payload.outputs.dependencies }}
           ANDROID_DEPENDENCIES: ${{ steps.app_payload.outputs.android_dependencies }}
+          APP_VERSION: ${{ steps.app_payload.outputs.app_version }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -4888,7 +5018,7 @@ jobs:
           print(f'Source totals: {dart_bytes} Dart bytes, {android_bytes} Android bytes.')
           PYFILES
 
-          python3 "$RUNNER_TEMP/patch_android_project.py" "$TARGET_DIR" "$PROJECT_NAME" "$PACKAGE_NAME"
+          python3 "$RUNNER_TEMP/patch_android_project.py" "$TARGET_DIR" "$PROJECT_NAME" "$PACKAGE_NAME" "$APP_VERSION"
 
           # Detect packages across every Dart source file, then merge with explicitly
           # requested packages. This supports imports in lib/screens/, lib/widgets/, etc.
