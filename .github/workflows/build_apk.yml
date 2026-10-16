@@ -447,14 +447,14 @@ jobs:
           # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
           # selected above supplies the current compatible SDK. cross_file 0.3.x is required
           # by both plugins; do not let Pub select the incompatible 0.4.x line.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0 crypto
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:2.1.0 file_picker:12.3.0 image:^4.12.0 crypto
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
           pubspec = Path('pubspec.yaml')
           text = pubspec.read_text(encoding='utf-8')
           replacements = {
-              'dynamic_color': '^1.8.1',
+              'dynamic_color': '^2.1.0',
               'file_picker': '^12.3.0',
               'share_plus': '^13.3.1',
               'cross_file': '^0.3.5+4',
@@ -3318,6 +3318,36 @@ jobs:
           
           
           
+            Future<void> _removeFile(String path) async {
+              // lib/main.dart is the required Flutter entry point and cannot be removed.
+              if (path == 'lib/main.dart') {
+                _message('lib/main.dart is the required app entry point. You can edit it, but it cannot be deleted.');
+                return;
+              }
+              if (!_additionalFiles.containsKey(path)) {
+                _message('That file is no longer in the project. Refresh the file list and try again.');
+                return;
+              }
+              final confirmed = await showDialog<bool>(
+                context: context,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('Delete file?'),
+                  content: Text('Delete ${path.split('/').last}? This removes the file from the project and its next build.'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+                    FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Delete file')),
+                  ],
+                ),
+              );
+              if (confirmed != true || !mounted) return;
+              setState(() {
+                _additionalFiles.remove(path);
+                _selectedTemplate = 'Custom project';
+              });
+              _scheduleDraftSave();
+              _message('Deleted ${path.split('/').last}.');
+            }
+
             Future<void> _createFolder({String? initialPath}) async {
               final controller = TextEditingController(text: initialPath ?? '');
               final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
