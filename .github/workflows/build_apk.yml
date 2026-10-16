@@ -2089,20 +2089,20 @@ jobs:
             }
           }
           DART
-          # Keep the builder's own launcher icon sourced from repository-root icon.png.
+          # Keep the builder's own launcher icon sourced from repository-root ico.png.
           # User-selected target-app icons are stored separately per build under .simple-app-builder/icons/.
-          if [[ -f "$GITHUB_WORKSPACE/icon.png" ]]; then
+          if [[ -f "$GITHUB_WORKSPACE/ico.png" ]]; then
             sudo apt-get update -qq
             sudo apt-get install -y imagemagick
             mkdir -p "$BUILDER_DIR/assets"
-            convert "$GITHUB_WORKSPACE/icon.png" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$BUILDER_DIR/assets/simple_app_builder_icon.png"
+            convert "$GITHUB_WORKSPACE/ico.png" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$BUILDER_DIR/assets/simple_app_builder_ico.png"
             flutter pub add --dev flutter_launcher_icons
             cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
-            image_path: "assets/simple_app_builder_icon.png"
+            image_path: "assets/simple_app_builder_ico.png"
             adaptive_icon_background: "#FFFFFF"
-            adaptive_icon_foreground: "assets/simple_app_builder_icon.png"
+            adaptive_icon_foreground: "assets/simple_app_builder_ico.png"
           ICONCONFIG
             dart run flutter_launcher_icons
           fi
@@ -2231,7 +2231,7 @@ jobs:
           fi
           flutter pub get
 
-      - name: Apply selected image or repository icon.png to all Android launcher icon variants
+      - name: Apply selected image or repository ico.png to all Android launcher icon variants
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
@@ -2251,11 +2251,11 @@ jobs:
               echo "ERROR: A custom icon was requested, but $ICON_PATH is missing from the checked-out repository." >&2
               exit 1
             fi
-          elif [[ -f "$GITHUB_WORKSPACE/icon.png" ]]; then
-            ICON_SOURCE="$GITHUB_WORKSPACE/icon.png"
-            echo 'No project-specific icon was selected; using repository-root icon.png as the fallback.'
+          elif [[ -f "$GITHUB_WORKSPACE/ico.png" ]]; then
+            ICON_SOURCE="$GITHUB_WORKSPACE/ico.png"
+            echo 'No project-specific icon was selected; using repository-root ico.png as the fallback.'
           else
-            echo 'No project icon was selected and no root icon.png exists; keeping Flutter launcher icons.'
+            echo 'No project icon was selected and no root ico.png exists; keeping Flutter launcher icons.'
             exit 0
           fi
           sudo apt-get update -qq
@@ -2263,15 +2263,15 @@ jobs:
           mkdir -p "$TARGET_DIR/assets"
           # Normalize PNG/JPEG/WebP/etc. from the chosen device image into a true PNG.
           # A white square canvas avoids clipping wide/tall images on Android adaptive-icon masks.
-          convert "$ICON_SOURCE" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$TARGET_DIR/assets/simple_app_builder_icon.png"
+          convert "$ICON_SOURCE" -auto-orient -strip -resize '768x768' -background white -gravity center -extent 1024x1024 "$TARGET_DIR/assets/simple_app_builder_ico.png"
           cd "$TARGET_DIR"
           flutter pub add --dev flutter_launcher_icons
           cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
-            image_path: "assets/simple_app_builder_icon.png"
+            image_path: "assets/simple_app_builder_ico.png"
             adaptive_icon_background: "#FFFFFF"
-            adaptive_icon_foreground: "assets/simple_app_builder_icon.png"
+            adaptive_icon_foreground: "assets/simple_app_builder_ico.png"
           ICONCONFIG
           dart run flutter_launcher_icons
           echo 'Applied the selected image to regular, round, and adaptive Android launcher icons.'
