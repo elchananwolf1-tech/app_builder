@@ -31,13 +31,11 @@ jobs:
           DART_CODE: ${{ github.event.client_payload.dart_code }}
           SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
           DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
-          HAS_CUSTOM_ICON: ${{ github.event.client_payload.has_custom_icon }}
-          ICON_PATH: ${{ github.event.client_payload.icon_path }}
-          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
-          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
-          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
-          BUILD_FORMAT: ${{ github.event.client_payload.build_format }}
-          SIGN_RELEASE: ${{ github.event.client_payload.sign_release }}
+          HAS_CUSTOM_ICON: ${{ github.event.client_payload.icon.custom }}
+          ICON_PATH: ${{ github.event.client_payload.icon.path }}
+          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.options.dynamic_themed_icon }}
+          BUILD_FORMAT: ${{ github.event.client_payload.options.build_format }}
+          SIGN_RELEASE: ${{ github.event.client_payload.options.sign_release }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -65,11 +63,6 @@ jobs:
                   sys.exit('Custom icon path is missing or invalid. Select the icon again and retry.')
           if bundle and not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle):
               sys.exit('source_archive_base64 contains invalid characters.')
-          bg = os.environ.get('ICON_BACKGROUND_COLOR', '').strip() or '#FFFFFF'
-          if not re.fullmatch(r'#[0-9A-Fa-f]{6}', bg):
-              sys.exit('icon_background_color must be a six-digit hex color such as #FFFFFF.')
-          if (os.environ.get('REMOVE_BACKGROUND', '').lower() or 'true') not in ('true', 'false'):
-              sys.exit('remove_background must be true or false.')
           if (os.environ.get('DYNAMIC_THEMED_ICON', '').lower() or 'true') not in ('true', 'false'):
               sys.exit('dynamic_themed_icon must be true or false.')
           output_format = (os.environ.get('BUILD_FORMAT', '').strip().lower() or 'apk')
@@ -322,108 +315,66 @@ jobs:
           PYPLUGIN
 
           cat > "$RUNNER_TEMP/prepare_launcher_icons.py" <<'PYICON'
-          import math, re, sys
+          import sys
           from pathlib import Path
           from PIL import Image, ImageOps
 
           source_path = Path(sys.argv[1])
           output_dir = Path(sys.argv[2])
-          remove_background = len(sys.argv) > 3 and sys.argv[3].lower() == 'true'
-          background_hex = sys.argv[4] if len(sys.argv) > 4 else '#FFFFFF'
-          dynamic_icon = len(sys.argv) <= 5 or sys.argv[5].lower() == 'true'
-          if not re.fullmatch(r'#[0-9A-Fa-f]{6}', background_hex):
-              raise SystemExit('Background color must be a six-digit hex color such as #FFFFFF.')
-          target = tuple(int(background_hex[i:i+2], 16) for i in (1, 3, 5))
+          dynamic_icon = len(sys.argv) > 3 and sys.argv[3].lower() == 'true'
           output_dir.mkdir(parents=True, exist_ok=True)
-          Image.new('RGBA', (1024, 1024), (0, 0, 0, 0)).save(output_dir / 'app_icon_background.png', format='PNG', optimize=True)
-
           try:
               with Image.open(source_path) as opened:
-                  image = ImageOps.exif_transpose(opened).convert('RGBA')
+                  source = ImageOps.exif_transpose(opened).convert('RGBA')
           except Exception as exc:
               raise SystemExit(f'Could not decode launcher image {source_path}: {exc}')
-          if image.width < 1 or image.height < 1 or image.width * image.height > 40000000:
-              raise SystemExit(f'Unsupported launcher image dimensions {image.width}x{image.height}; maximum is 40 megapixels.')
-          image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+          if source.width < 1 or source.height < 1 or source.width * source.height > 40000000:
+              raise SystemExit(f'Unsupported launcher image dimensions {source.width}x{source.height}; maximum is 40 megapixels.')
+          source.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
 
-          def fit_artwork(source, max_size=768):
-              # thumbnail() only shrinks. Once a uniform background is cropped from a
-              # small logo, explicitly scale it up to fill a useful portion of the
-              # 1024px launcher canvas without changing its aspect ratio.
-              width, height = source.size
+          def fit(source_image, max_size=780):
+              width, height = source_image.size
               if width < 1 or height < 1:
-                  raise SystemExit('The cropped logo has no visible dimensions.')
+                  raise SystemExit('The logo has no visible dimensions.')
               scale = min(max_size / width, max_size / height)
-              new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-              if new_size == source.size:
-                  return source
-              return source.resize(new_size, Image.Resampling.LANCZOS)
+              size = (max(1, round(width * scale)), max(1, round(height * scale)))
+              return source_image if size == source_image.size else source_image.resize(size, Image.Resampling.LANCZOS)
 
-          def remove_color_background(source, rgb, tolerance=28, feather=48):
-              result = source.copy()
-              px = result.load()
-              width, height = result.size
-              changed = 0
-              for y in range(height):
-                  for x in range(width):
-                      r, g, b, alpha = px[x, y]
-                      if alpha <= 0:
-                          continue
-                      distance = math.sqrt((r-rgb[0])**2 + (g-rgb[1])**2 + (b-rgb[2])**2)
-                      if distance <= tolerance:
-                          px[x, y] = (r, g, b, 0)
-                          changed += 1
-                      elif distance <= tolerance + feather:
-                          new_alpha = round(alpha * (distance - tolerance) / feather)
-                          px[x, y] = (r, g, b, max(0, min(255, new_alpha)))
-                          changed += 1
-              if changed == 0:
-                  print('WARNING: No pixels closely matched the selected background color; the logo may have a non-uniform or different background.', file=sys.stderr)
-              return result
+          # Do not remove/replace any source pixels. Regular icons use a solid white canvas to
+          # avoid Android/launcher black backgrounds when original transparency is mishandled.
+          artwork = fit(source)
+          white_canvas = Image.new('RGBA', (1024, 1024), (255, 255, 255, 255))
+          white_canvas.alpha_composite(artwork, ((1024-artwork.width)//2, (1024-artwork.height)//2))
+          white_canvas.save(output_dir / 'app_icon.png', format='PNG', optimize=True)
 
-          # Color/legacy icon. If the option is enabled, every pixel near the selected
-          # background color is made transparent (not only pixels connected to the edges).
-          color_source = remove_color_background(image, target) if remove_background else image.copy()
-          color_bbox = color_source.getchannel('A').getbbox()
-          if color_bbox is None:
-              # Avoid failing the whole APK build for a logo that is entirely the chosen
-              # background color. Preserve the original artwork and warn instead.
-              print('WARNING: background removal would make the entire logo transparent; preserving the original image for the color icon. Choose a more accurate background color to remove the backdrop.', file=sys.stderr)
-              color_source = image.copy()
-              color_bbox = color_source.getchannel('A').getbbox()
-          if color_bbox is None:
-              raise SystemExit('The selected image is fully transparent. Choose a different logo image.')
-          color_source = fit_artwork(color_source.crop(color_bbox), 768)
-          color_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
-          color_canvas.alpha_composite(color_source, ((1024-color_source.width)//2, (1024-color_source.height)//2))
-          color_canvas.save(output_dir / 'app_icon.png', format='PNG', optimize=True)
+          # Adaptive foreground retains source alpha/colors. Opaque input logos remain opaque;
+          # the configured adaptive background is white, never a generated transparent square.
+          foreground = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+          foreground.alpha_composite(artwork, ((1024-artwork.width)//2, (1024-artwork.height)//2))
+          foreground.save(output_dir / 'app_icon_foreground.png', format='PNG', optimize=True)
 
-          # Adaptive foreground uses the same cut-out setting as the color/legacy icon.
-          foreground_canvas = color_canvas.copy()
-          foreground_canvas.save(output_dir / 'app_icon_foreground.png', format='PNG', optimize=True)
-
-          if dynamic_icon:
-              # A themed icon is a white silhouette with alpha transparency. The launcher
-              # uses alpha as a mask and supplies its own theme tint, so no white square is added.
-              themed_source = remove_color_background(image, target)
-              themed_bbox = themed_source.getchannel('A').getbbox()
-              if themed_bbox is None:
-                  # A plain white/dark logo can match the selected removal color completely.
-                  # Keep the original alpha silhouette as a fallback so that an optional
-                  # themed icon does not cause an otherwise valid APK build to fail.
-                  print('WARNING: selected background color removed the whole themed icon; using the image alpha silhouette as a fallback.', file=sys.stderr)
-                  themed_source = image.copy()
-                  themed_bbox = themed_source.getchannel('A').getbbox()
-              if themed_bbox is None:
-                  raise SystemExit('The selected image is fully transparent; a themed icon cannot be generated.')
-              themed_source = fit_artwork(themed_source.crop(themed_bbox), 768)
-              themed_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
-              alpha = themed_source.getchannel('A')
-              white = Image.new('RGBA', themed_source.size, (255, 255, 255, 0))
-              white.putalpha(alpha)
-              themed_canvas.alpha_composite(white, ((1024-white.width)//2, (1024-white.height)//2))
-              themed_canvas.save(output_dir / 'app_icon_monochrome.png', format='PNG', optimize=True)
-          print(f'Generated launcher images; remove_background={remove_background}, background={background_hex}, dynamic_themed_icon={dynamic_icon}.')
+          mono_path = output_dir / 'app_icon_monochrome.png'
+          if mono_path.exists():
+              mono_path.unlink()
+          alpha = artwork.getchannel('A')
+          alpha_extrema = alpha.getextrema()
+          # Only produce a theme mask if the source already has real transparency. Never infer
+          # transparent pixels from white/black colors: that is the background-removal feature
+          # the user explicitly requested to disable.
+          if dynamic_icon and alpha_extrema[0] < 255:
+              bbox = alpha.getbbox()
+              if bbox:
+                  alpha_crop = alpha.crop(bbox)
+                  silhouette = Image.new('RGBA', alpha_crop.size, (255, 255, 255, 0))
+                  silhouette.putalpha(alpha_crop)
+                  silhouette = fit(silhouette, 780)
+                  mono = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+                  mono.alpha_composite(silhouette, ((1024-silhouette.width)//2, (1024-silhouette.height)//2))
+                  mono.save(mono_path, format='PNG', optimize=True)
+                  print('Generated monochrome themed-icon layer from source alpha; no colors were removed.')
+          else:
+              print('::warning::The logo has no transparent pixels or themed icons are disabled. Kept the logo unchanged and skipped the monochrome layer.')
+          print(f'Generated a white-background launcher icon from {source_path}; the source background/colors were preserved.')
           PYICON
 
       - name: Generate the real Simple App Builder application
@@ -466,14 +417,12 @@ jobs:
           import 'dart:async';
           import 'dart:convert';
           import 'dart:io';
-          import 'dart:math' as math;
           import 'dart:typed_data';
 
           import 'package:archive/archive.dart';
           import 'package:cross_file/cross_file.dart';
           import 'package:dynamic_color/dynamic_color.dart';
           import 'package:file_picker/file_picker.dart';
-          import 'package:flutter/foundation.dart' show compute;
           import 'package:flutter/material.dart';
           import 'package:flutter_code_editor/flutter_code_editor.dart';
           import 'package:flutter_highlight/themes/github.dart';
@@ -497,71 +446,15 @@ jobs:
           const String workflowFile = 'build_apk.yml';
           const FlutterSecureStorage secureStorage = FlutterSecureStorage();
 
-          String _normaliseLauncherHex(String value) {
-            var raw = value.trim().replaceAll('#', '').toUpperCase();
-            if (RegExp(r'^[0-9A-F]{3}$').hasMatch(raw)) raw = raw.split('').map((c) => '$c$c').join();
-            return RegExp(r'^[0-9A-F]{6}$').hasMatch(raw) ? '#$raw' : '#FFFFFF';
-          }
-
-          void _removeLauncherBackground(img.Image image, String hex, {int tolerance = 32}) {
-            final clean = _normaliseLauncherHex(hex).substring(1);
-            final tr = int.parse(clean.substring(0, 2), radix: 16);
-            final tg = int.parse(clean.substring(2, 4), radix: 16);
-            final tb = int.parse(clean.substring(4, 6), radix: 16);
-            for (final pixel in image) {
-              if (pixel.a <= 0) continue;
-              final dr = pixel.r.toDouble() - tr, dg = pixel.g.toDouble() - tg, db = pixel.b.toDouble() - tb;
-              final distance = math.sqrt(dr * dr + dg * dg + db * db);
-              if (distance <= tolerance) {
-                pixel.a = 0;
-              } else if (distance <= tolerance + 42) {
-                pixel.a = (pixel.a * ((distance - tolerance) / 42.0)).round().clamp(0, 255);
-              }
-            }
-          }
-
           Uint8List _buildLauncherIconPreview(Map<String, Object?> args) {
             final sourceBytes = args['bytes'] as Uint8List;
             final decoded = img.decodeImage(sourceBytes);
             if (decoded == null || decoded.width < 1 || decoded.height < 1 || decoded.width * decoded.height > 40000000) {
               throw Exception('Unsupported or oversized image.');
             }
-            final scale = 256.0 / math.max(decoded.width, decoded.height);
-            final width = math.max(1, (decoded.width * scale).round()).toInt();
-            final height = math.max(1, (decoded.height * scale).round()).toInt();
-            final preview = scale < 1 ? img.copyResize(decoded, width: width, height: height) : decoded.clone();
-            if (args['removeBackground'] == true) {
-              _removeLauncherBackground(preview, (args['backgroundColor'] ?? '#FFFFFF').toString());
-            }
-            return Uint8List.fromList(img.encodePng(preview));
-          }
-
-          String _detectLauncherBackgroundColor(Uint8List bytes) {
-            final decoded = img.decodeImage(bytes);
-            if (decoded == null || decoded.width < 1 || decoded.height < 1 || decoded.width * decoded.height > 40000000) {
-              throw Exception('The image is unsupported or too large to analyze.');
-            }
-            final buckets = <int, List<int>>{};
-            void sample(int x, int y) {
-              final pixel = decoded.getPixel(x, y);
-              if (pixel.a < 200) return;
-              final r = pixel.r.toInt().clamp(0, 255).toInt();
-              final g = pixel.g.toInt().clamp(0, 255).toInt();
-              final b = pixel.b.toInt().clamp(0, 255).toInt();
-              final key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
-              final stats = buckets.putIfAbsent(key, () => [0, 0, 0, 0]);
-              stats[0] += r; stats[1] += g; stats[2] += b; stats[3]++;
-            }
-            final sx = math.max(1, decoded.width ~/ 128).toInt();
-            final sy = math.max(1, decoded.height ~/ 128).toInt();
-            for (var x = 0; x < decoded.width; x += sx) { sample(x, 0); sample(x, decoded.height - 1); }
-            for (var y = 0; y < decoded.height; y += sy) { sample(0, y); sample(decoded.width - 1, y); }
-            if (buckets.isEmpty) throw Exception('No opaque background pixels were found along the image edges. The image may already have a transparent background.');
-            final best = buckets.values.reduce((a, b) => a[3] >= b[3] ? a : b);
-            final r = (best[0] / best[3]).round().clamp(0, 255).toInt();
-            final g = (best[1] / best[3]).round().clamp(0, 255).toInt();
-            final b = (best[2] / best[3]).round().clamp(0, 255).toInt();
-            return '#${r.toRadixString(16).padLeft(2, '0')}${g.toRadixString(16).padLeft(2, '0')}${b.toRadixString(16).padLeft(2, '0')}'.toUpperCase();
+            // Deliberately do not alter source pixels or remove any background color.
+            // White background handling happens only when generating launcher assets.
+            return sourceBytes;
           }
 
           void main() => runApp(const SimpleAppBuilder());
@@ -591,8 +484,6 @@ jobs:
               this.dependencies = '',
               this.iconBase64,
               this.repository = '',
-              this.removeBackground = true,
-              this.iconBackgroundColor = '#FFFFFF',
               this.dynamicThemedIcon = true,
               this.buildFormat = 'apk',
               this.signRelease = false,
@@ -609,8 +500,6 @@ jobs:
             final Set<String> folders;
             final String dependencies;
             final String? iconBase64;
-            final bool removeBackground;
-            final String iconBackgroundColor;
             final bool dynamicThemedIcon;
             final String repository;
             final String buildFormat;
@@ -625,8 +514,6 @@ jobs:
               String? dependencies,
               String? iconBase64,
               String? repository,
-              bool? removeBackground,
-              String? iconBackgroundColor,
               bool? dynamicThemedIcon,
               String? buildFormat,
               bool? signRelease,
@@ -641,8 +528,6 @@ jobs:
                   dependencies: dependencies ?? this.dependencies,
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
                   repository: repository ?? this.repository,
-                  removeBackground: removeBackground ?? this.removeBackground,
-                  iconBackgroundColor: iconBackgroundColor ?? this.iconBackgroundColor,
                   dynamicThemedIcon: dynamicThemedIcon ?? this.dynamicThemedIcon,
                   buildFormat: buildFormat ?? this.buildFormat,
                   signRelease: signRelease ?? this.signRelease,
@@ -658,8 +543,6 @@ jobs:
                   'dependencies': dependencies,
                   'iconBase64': iconBase64,
                   'repository': repository,
-                  'removeBackground': removeBackground,
-                  'iconBackgroundColor': iconBackgroundColor,
                   'dynamicThemedIcon': dynamicThemedIcon,
                   'buildFormat': buildFormat,
                   'signRelease': signRelease,
@@ -695,8 +578,6 @@ jobs:
                 dependencies: (json['dependencies'] ?? '').toString(),
                 iconBase64: json['iconBase64']?.toString(),
                 repository: (json['repository'] ?? '').toString(),
-                removeBackground: json['removeBackground'] is bool ? json['removeBackground'] as bool : true,
-                iconBackgroundColor: (json['iconBackgroundColor'] ?? '#FFFFFF').toString(),
                 dynamicThemedIcon: json['dynamicThemedIcon'] is bool ? json['dynamicThemedIcon'] as bool : true,
                 buildFormat: (json['buildFormat'] ?? 'apk').toString() == 'aab' ? 'aab' : 'apk',
                 signRelease: json['signRelease'] is bool ? json['signRelease'] as bool : false,
@@ -1118,8 +999,6 @@ jobs:
               required String dependencies,
               required bool hasCustomIcon,
               required String iconPath,
-              required bool removeBackground,
-              required String iconBackgroundColor,
               required bool dynamicThemedIcon,
               required String requestId,
               String buildFormat = 'apk',
@@ -1133,13 +1012,12 @@ jobs:
                   'project_name': projectName,
                   'package_name': packageName,
                   'dependencies': dependencies,
-                  'has_custom_icon': hasCustomIcon,
-                  'icon_path': iconPath,
-                  'remove_background': removeBackground,
-                  'icon_background_color': iconBackgroundColor,
-                  'dynamic_themed_icon': dynamicThemedIcon,
-                  'build_format': buildFormat,
-                  'sign_release': signRelease,
+                  'icon': {'custom': hasCustomIcon, 'path': iconPath},
+                  'options': {
+                    'dynamic_themed_icon': dynamicThemedIcon,
+                    'build_format': buildFormat,
+                    'sign_release': signRelease,
+                  },
                   'request_id': requestId,
                 },
               });
@@ -1755,7 +1633,7 @@ jobs:
                           const SizedBox(height: 8),
                           ...widget.projects.map((project) => Card(
                             child: ListTile(
-                              leading: CircleAvatar(child: project.iconBase64 == null ? const Icon(Icons.phone_android) : ClipOval(child: Image.memory(base64Decode(project.iconBase64!), fit: BoxFit.cover, width: 44, height: 44))),
+                              leading: CircleAvatar(backgroundColor: Colors.white, child: project.iconBase64 == null ? const Icon(Icons.phone_android, color: Colors.black54) : ClipOval(child: Image.memory(base64Decode(project.iconBase64!), fit: BoxFit.contain, width: 44, height: 44))),
                               title: Text(project.name, maxLines: 1, overflow: TextOverflow.ellipsis),
                               subtitle: Text(project.repository.isNotEmpty ? '${project.packageName} · ${project.repository}' : project.packageName, maxLines: 2, overflow: TextOverflow.ellipsis),
                               onTap: () => _openWizard(project: project),
@@ -1772,7 +1650,7 @@ jobs:
                                   PopupMenuItem(value: 'build', child: ListTile(dense: true, leading: Icon(Icons.rocket_launch_outlined), title: Text('Build / manage'))),
                                   PopupMenuItem(value: 'name', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename'))),
                                   PopupMenuItem(value: 'code', child: ListTile(dense: true, leading: Icon(Icons.code), title: Text('Edit Dart source'))),
-                                  PopupMenuItem(value: 'live', child: ListTile(dense: true, leading: Icon(Icons.web), title: Text('Live App (Flutter Web)'))),
+                                  PopupMenuItem(value: 'live', child: ListTile(dense: true, leading: Icon(Icons.web), title: Text('Flutter Preview (Web)'))),
                                   PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete'))),
                                 ],
                               ),
@@ -2030,15 +1908,13 @@ jobs:
             late String _dartCode;
             late Map<String, String> _additionalFiles;
             late Set<String> _folders;
+            String _currentFolder = 'lib';
             String _selectedTemplate = 'Material 3 starter';
             String _buildFormat = 'apk';
             bool _signRelease = false;
             Uint8List? _iconBytes;
             Uint8List? _iconPreviewBytes;
-            bool _removeBackground = true;
-            String _iconBackgroundColor = '#FFFFFF';
             bool _dynamicThemedIcon = true;
-            bool _detectingBackground = false;
             int _step = 0;
             bool _building = false;
             String _status = '';
@@ -2049,6 +1925,39 @@ jobs:
             DateTime? _buildStartedAt;
 
             List<String> get _sortedAdditionalPaths => _additionalFiles.keys.toList()..sort();
+            String get _currentFolderPrefix => '$_currentFolder/';
+            List<String> get _visibleFolders => _folders.where((folder) {
+              if (!folder.startsWith(_currentFolderPrefix)) return false;
+              final remainder = folder.substring(_currentFolderPrefix.length);
+              return remainder.isNotEmpty && !remainder.contains('/');
+            }).toList()..sort();
+            List<String> get _visibleFiles => _allDartFiles().keys.where((file) {
+              if (!file.startsWith(_currentFolderPrefix)) return false;
+              final remainder = file.substring(_currentFolderPrefix.length);
+              return remainder.isNotEmpty && !remainder.contains('/');
+            }).toList()..sort();
+
+            void _openFolder(String path) {
+              if (!_folders.contains(path)) return;
+              setState(() => _currentFolder = path);
+            }
+
+            void _goToParentFolder() {
+              if (_currentFolder == 'lib') return;
+              final slash = _currentFolder.lastIndexOf('/');
+              setState(() => _currentFolder = slash <= 0 ? 'lib' : _currentFolder.substring(0, slash));
+            }
+
+            String _normaliseNewPath(String raw, {required bool folder}) {
+              var path = raw.trim().replaceAll('\\', '/').replaceAll(RegExp(r'^/+|/+$'), '');
+              if (path.isEmpty) return '';
+              if (!path.startsWith('lib/')) path = '$_currentFolder/$path';
+              path = path.replaceAll(RegExp(r'/+'), '/');
+              if (folder) return path;
+              if (!path.toLowerCase().endsWith('.dart')) path = '$path.dart';
+              return path;
+            }
+
 
             @override
             void initState() {
@@ -2089,8 +1998,6 @@ jobs:
               if (widget.existing?.iconBase64 != null) {
                 try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
               }
-              _removeBackground = widget.existing?.removeBackground ?? true;
-              _iconBackgroundColor = _normaliseHex(widget.existing?.iconBackgroundColor ?? '#FFFFFF');
               _dynamicThemedIcon = widget.existing?.dynamicThemedIcon ?? true;
               if (_iconBytes != null) {
                 _iconPreviewBytes = _iconBytes;
@@ -2116,8 +2023,6 @@ jobs:
               dependencies: _dependencies.text.trim(),
               iconBase64: _iconBytes == null ? null : base64Encode(_iconBytes!),
               repository: normalizeRepository(repository ?? (_targetRepository.isNotEmpty ? _targetRepository : (widget.existing?.repository ?? ''))),
-              removeBackground: _removeBackground,
-              iconBackgroundColor: _iconBackgroundColor,
               dynamicThemedIcon: _dynamicThemedIcon,
               folders: Set<String>.from(_folders),
               buildFormat: _buildFormat,
@@ -2181,24 +2086,9 @@ jobs:
               if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
             }
 
-            String _normaliseHex(String value) => _normaliseLauncherHex(value);
-
             Future<void> _refreshIconPreview() async {
               final sourceBytes = _iconBytes;
-              if (sourceBytes == null) {
-                if (mounted) setState(() => _iconPreviewBytes = null);
-                return;
-              }
-              try {
-                final bytes = await compute(_buildLauncherIconPreview, <String, Object?>{
-                  'bytes': sourceBytes,
-                  'removeBackground': _removeBackground,
-                  'backgroundColor': _iconBackgroundColor,
-                });
-                if (mounted && identical(_iconBytes, sourceBytes)) setState(() => _iconPreviewBytes = bytes);
-              } catch (_) {
-                if (mounted && identical(_iconBytes, sourceBytes)) setState(() => _iconPreviewBytes = sourceBytes);
-              }
+              if (mounted) setState(() => _iconPreviewBytes = sourceBytes);
             }
 
             Future<void> _pickIcon() async {
@@ -2214,54 +2104,6 @@ jobs:
                 await _refreshIconPreview();
               } catch (error) {
                 _message('Could not open this image: $error');
-              }
-            }
-
-            Future<void> _chooseIconBackgroundColor() async {
-              final controller = TextEditingController(text: _iconBackgroundColor);
-              var chosen = _iconBackgroundColor;
-              const swatches = <String>['#FFFFFF', '#000000', '#F5F5F5', '#ECEFF1', '#FFF3E0', '#E3F2FD', '#E8F5E9', '#FCE4EC', '#673AB7', '#2196F3', '#00897B', '#FFC107'];
-              final result = await showDialog<String>(
-                context: context,
-                builder: (dialogContext) => StatefulBuilder(builder: (context, setDialogState) => AlertDialog(
-                  title: const Text('Background color to remove'),
-                  content: SizedBox(width: 420, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    const Text('Choose the color that should become transparent in the logo. The same color is used for the adaptive-icon background.'),
-                    const SizedBox(height: 12),
-                    TextField(controller: controller, decoration: const InputDecoration(labelText: 'Hex color', hintText: '#FFFFFF'), onChanged: (value) { if (RegExp(r'^#?[0-9A-Fa-f]{6}$').hasMatch(value.trim())) setDialogState(() => chosen = _normaliseHex(value)); }),
-                    const SizedBox(height: 12),
-                    Wrap(spacing: 8, runSpacing: 8, children: swatches.map((hex) => InkWell(
-                      borderRadius: BorderRadius.circular(24),
-                      onTap: () { setDialogState(() { chosen = hex; controller.text = hex; }); },
-                      child: Container(width: 36, height: 36, decoration: BoxDecoration(color: Color(int.parse('FF${hex.substring(1)}', radix: 16)), shape: BoxShape.circle, border: Border.all(color: chosen == hex ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.outline, width: chosen == hex ? 3 : 1))),
-                    )).toList()),
-                    const SizedBox(height: 12),
-                    Row(children: [Container(width: 28, height: 28, decoration: BoxDecoration(color: Color(int.parse('FF${chosen.substring(1)}', radix: 16)), borderRadius: BorderRadius.circular(6), border: Border.all(color: Theme.of(context).colorScheme.outline)),), const SizedBox(width: 8), Text(chosen)]),
-                  ])),
-                  actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () { if (RegExp(r'^#[0-9A-Fa-f]{6}$').hasMatch(chosen)) Navigator.pop(dialogContext, chosen.toUpperCase()); }, child: const Text('Use color'))],
-                )),
-              );
-              controller.dispose();
-              if (result == null) return;
-              setState(() => _iconBackgroundColor = _normaliseHex(result));
-              await _refreshIconPreview();
-            }
-
-            Future<void> _detectIconBackgroundColor() async {
-              final bytes = _iconBytes;
-              if (bytes == null) { _message('Choose an image first.'); return; }
-              setState(() => _detectingBackground = true);
-              try {
-                await Future<void>.delayed(const Duration(milliseconds: 120));
-                final hex = await compute(_detectLauncherBackgroundColor, bytes);
-                if (!mounted || !identical(_iconBytes, bytes)) return;
-                setState(() => _iconBackgroundColor = hex);
-                await _refreshIconPreview();
-                _message('Detected edge background color: $hex');
-              } catch (error) {
-                _message('Could not detect the background color: $error');
-              } finally {
-                if (mounted) setState(() => _detectingBackground = false);
               }
             }
 
@@ -2308,6 +2150,7 @@ jobs:
                   _dartCode = imported.remove('lib/main.dart')!;
                   _additionalFiles = imported;
                   _folders = <String>{...imported.keys.expand(_folderAncestors)};
+                  _currentFolder = 'lib';
                   _selectedTemplate = 'Custom project';
                 });
                 _message('Imported ${_additionalFiles.length + 1} Dart files. Other Flutter project files/assets are not copied by this Dart-source importer.');
@@ -2349,6 +2192,7 @@ jobs:
                   _dartCode = imported.remove('lib/main.dart')!;
                   _additionalFiles = imported;
                   _folders = <String>{...imported.keys.expand(_folderAncestors)};
+                  _currentFolder = 'lib';
                   _selectedTemplate = 'Custom project';
                 });
                 _message('Imported ${_additionalFiles.length + 1} Dart files from ${picked.name}.');
@@ -2374,47 +2218,52 @@ jobs:
               });
             }
 
-            Future<void> _addDartFile({String initialPath = 'lib/screens/new_screen.dart'}) async {
-              final controller = TextEditingController(text: initialPath);
-              final path = await showDialog<String>(context: context, builder: (context) => AlertDialog(
-                title: const Text('Add Dart file'),
-                content: SizedBox(width: 440, child: TextField(
+            Future<void> _addDartFile({String? initialPath}) async {
+              final controller = TextEditingController(text: initialPath ?? '');
+              final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+                title: const Text('Create Dart file'),
+                content: TextField(
                   controller: controller,
                   autofocus: true,
                   autocorrect: false,
-                  decoration: const InputDecoration(
-                    labelText: 'File path',
-                    hintText: 'lib/screens/home_screen.dart',
-                    helperText: 'Use a path under lib/, including folders and the .dart extension.',
+                  decoration: InputDecoration(
+                    labelText: 'File name or relative path',
+                    hintText: 'home.dart or screens/home.dart',
+                    helperText: 'Created inside ${_currentFolder == 'lib' ? 'lib/' : 'lib/${_currentFolder.substring(4)}/'}. You may enter nested folders such as main/main.dart.',
                   ),
-                )),
+                ),
                 actions: [
-                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-                  FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('Create file')),
+                  TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Create file')),
                 ],
               ));
               controller.dispose();
-              if (path == null) return;
+              if (input == null || input.trim().isEmpty) return;
+              final path = _normaliseNewPath(input, folder: false);
               if (!_isSafeDartPath(path) || path == 'lib/main.dart') {
-                _message('Use a path such as lib/screens/home_screen.dart. lib/main.dart is the required entry point.');
+                _message('Enter a safe Dart file name such as home.dart or screens/home.dart. lib/main.dart is the required app entry point.');
                 return;
               }
-              if (_additionalFiles.containsKey(path)) {
-                _message('That file already exists. Open it from the file list instead.');
+              if (_allDartFiles().containsKey(path)) {
+                _message('That file already exists. Open it from the current folder.');
                 return;
               }
+              final parent = path.substring(0, path.lastIndexOf('/'));
               final className = _widgetClassNameForPath(path);
               setState(() {
                 _folders.addAll(_folderAncestors(path));
+                _folders.addAll(_folderAncestors('$parent/placeholder.dart'));
+                if (parent != 'lib') _folders.add(parent);
                 _additionalFiles[path] = '''import 'package:flutter/material.dart';
 
           class $className extends StatelessWidget {
-          const $className({super.key});
+            const $className({super.key});
 
-          @override
-          Widget build(BuildContext context) => const SizedBox.shrink();
+            @override
+            Widget build(BuildContext context) => const SizedBox.shrink();
           }
           ''';
+                _currentFolder = parent;
                 _selectedTemplate = 'Custom project';
               });
               await _editFile(path);
@@ -2433,34 +2282,52 @@ jobs:
               if (confirmed == true) setState(() => _additionalFiles.remove(path));
             }
 
-            Future<void> _createFolder({String initialPath = 'lib/models'}) async {
-              final controller = TextEditingController(text: initialPath);
-              final path = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+            Future<void> _createFolder({String? initialPath}) async {
+              final controller = TextEditingController(text: initialPath ?? '');
+              final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
                 title: const Text('Create folder'),
-                content: TextField(controller: controller, autofocus: true, autocorrect: false,
-                  decoration: const InputDecoration(labelText: 'Folder path', hintText: 'lib/models', helperText: 'Create folders under lib/. Use forward slashes.'),),
-                actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Create folder'))],
+                content: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  autocorrect: false,
+                  decoration: InputDecoration(
+                    labelText: 'Folder name or relative path',
+                    hintText: 'models or screens/auth',
+                    helperText: 'Created inside ${_currentFolder == 'lib' ? 'lib/' : 'lib/${_currentFolder.substring(4)}/'}.',
+                  ),
+                ),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Create folder')),
+                ],
               ));
               controller.dispose();
-              if (path == null) return;
-              if (!_isSafeFolderPath(path)) { _message('Use a safe folder path such as lib/models or lib/screens/auth.'); return; }
+              if (input == null || input.trim().isEmpty) return;
+              final path = _normaliseNewPath(input, folder: true);
+              if (!_isSafeFolderPath(path)) { _message('Enter a folder name such as models or a nested path such as screens/auth.'); return; }
               if (_folders.contains(path)) { _message('That folder already exists.'); return; }
-              setState(() { _folders.addAll(_folderAncestors('$path/placeholder.dart')); _folders.add(path); });
-              _message('Folder created: $path');
+              setState(() {
+                _folders.addAll(_folderAncestors('$path/placeholder.dart'));
+                _folders.add(path);
+                _selectedTemplate = 'Custom project';
+              });
+              _message('Created folder ${path.split('/').last}. Open it to add files or subfolders.');
             }
 
             Future<void> _renameFolder(String oldPath) async {
-              final controller = TextEditingController(text: oldPath);
-              final newPath = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+              final oldParent = oldPath.substring(0, oldPath.lastIndexOf('/'));
+              final controller = TextEditingController(text: oldPath.split('/').last);
+              final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
                 title: const Text('Rename folder'),
-                content: TextField(controller: controller, autofocus: true, autocorrect: false, decoration: const InputDecoration(labelText: 'New folder path', hintText: 'lib/models/new_name')),
+                content: TextField(controller: controller, autofocus: true, autocorrect: false, decoration: const InputDecoration(labelText: 'New folder name', hintText: 'new_name')),
                 actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Rename'))],
               ));
               controller.dispose();
-              if (newPath == null || newPath == oldPath) return;
-              if (!_isSafeFolderPath(newPath) || newPath.startsWith('$oldPath/') || oldPath.startsWith('$newPath/')) { _message('Choose a valid destination folder outside the folder being renamed.'); return; }
-              final newConflicts = _folders.contains(newPath) || _folders.any((folder) => folder.startsWith('$newPath/')) || _additionalFiles.keys.any((file) => file.startsWith('$newPath/'));
-              if (newConflicts) { _message('The destination folder or a file in it already exists.'); return; }
+              if (input == null || input.trim().isEmpty || input.trim() == oldPath.split('/').last) return;
+              final newPath = input.contains('/') ? _normaliseNewPath(input, folder: true) : '$oldParent/${input.trim()}';
+              if (!_isSafeFolderPath(newPath) || newPath == oldPath || newPath.startsWith('$oldPath/')) { _message('Choose a valid new folder name.'); return; }
+              final newConflicts = _folders.contains(newPath) || _folders.any((folder) => folder.startsWith('$newPath/')) || _allDartFiles().keys.any((file) => file.startsWith('$newPath/'));
+              if (newConflicts) { _message('A folder or file already exists at that destination.'); return; }
               setState(() {
                 final movedFiles = <String, String>{};
                 for (final entry in _additionalFiles.entries) {
@@ -2478,9 +2345,12 @@ jobs:
                 movedFolders.addAll(_folderAncestors('$newPath/placeholder.dart'));
                 _additionalFiles = movedFiles;
                 _folders = movedFolders;
+                if (_currentFolder == oldPath || _currentFolder.startsWith('$oldPath/')) {
+                  _currentFolder = '$newPath${_currentFolder.substring(oldPath.length)}';
+                }
                 _selectedTemplate = 'Custom project';
               });
-              _message('Folder renamed to $newPath. Imports in Dart files may need updating.');
+              _message('Folder renamed to ${newPath.split('/').last}. Imports in Dart files may need updating.');
             }
 
             Future<void> _deleteFolder(String path) async {
@@ -2493,6 +2363,10 @@ jobs:
               setState(() {
                 _additionalFiles.removeWhere((file, _) => file.startsWith('$path/'));
                 _folders.removeWhere((folder) => folder == path || folder.startsWith('$path/'));
+                if (_currentFolder == path || _currentFolder.startsWith('$path/')) {
+                  final slash = path.lastIndexOf('/');
+                  _currentFolder = slash <= 0 ? 'lib' : path.substring(0, slash);
+                }
               });
             }
 
@@ -2515,6 +2389,7 @@ jobs:
                 _dartCode = starter['lib/main.dart']!;
                 _additionalFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
                 _folders = <String>{..._additionalFiles.keys.expand(_folderAncestors)};
+                _currentFolder = 'lib';
               });
             }
 
@@ -2682,13 +2557,12 @@ jobs:
                     'project_name': _name.text.trim(),
                     'package_name': _packageName.text.trim(),
                     'dependencies': _dependencies.text.trim(),
-                    'has_custom_icon': hasCustomIcon,
-                    'icon_path': iconPath,
-                    'remove_background': _removeBackground,
-                    'icon_background_color': _normaliseHex(_iconBackgroundColor),
-                    'dynamic_themed_icon': _dynamicThemedIcon,
-                    'build_format': outputFormat,
-                    'sign_release': _signRelease && !isPreview,
+                    'icon': {'custom': hasCustomIcon, 'path': iconPath},
+                    'options': {
+                      'dynamic_themed_icon': _dynamicThemedIcon,
+                      'build_format': outputFormat,
+                      'sign_release': _signRelease && !isPreview,
+                    },
                     'request_id': requestId,
                   },
                 })).length;
@@ -2708,8 +2582,6 @@ jobs:
                   dependencies: _dependencies.text.trim(),
                   hasCustomIcon: hasCustomIcon,
                   iconPath: iconPath,
-                  removeBackground: _removeBackground,
-                  iconBackgroundColor: _iconBackgroundColor,
                   dynamicThemedIcon: _dynamicThemedIcon,
                   requestId: requestId,
                   buildFormat: outputFormat,
@@ -2959,12 +2831,12 @@ jobs:
               margin: const EdgeInsets.only(bottom: 6),
               child: ListTile(
                 leading: Icon(isMain ? Icons.play_circle_outline : Icons.code, color: Theme.of(context).colorScheme.primary),
-                title: Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
-                subtitle: Text(isMain ? 'App entry point' : 'Folder: ${path.substring(0, path.lastIndexOf('/'))}'),
+                title: Text(path.split('/').last, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(isMain ? 'App entry point' : 'Dart source file'),
                 onTap: () => _editFile(path),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
-                  IconButton(tooltip: 'Edit $path', onPressed: () => _editFile(path), icon: const Icon(Icons.edit_outlined)),
-                  if (!isMain) IconButton(tooltip: 'Delete $path', onPressed: () => _removeFile(path), icon: const Icon(Icons.delete_outline)),
+                  IconButton(tooltip: 'Edit ${path.split('/').last}', onPressed: () => _editFile(path), icon: const Icon(Icons.edit_outlined)),
+                  if (!isMain) IconButton(tooltip: 'Delete ${path.split('/').last}', onPressed: () => _removeFile(path), icon: const Icon(Icons.delete_outline)),
                 ]),
               ),
             );
@@ -2980,9 +2852,17 @@ jobs:
                 onStepCancel: _building ? null : () { if (_step > 0) setState(() => _step--); else Navigator.pop(context); },
                 controlsBuilder: (context, details) => Padding(
                   padding: const EdgeInsets.only(top: 16),
-                  child: Row(children: [
-                    FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build ${_buildFormat.toUpperCase()}') : 'Continue')),
-                    const SizedBox(width: 10),
+                  child: Wrap(spacing: 10, runSpacing: 8, crossAxisAlignment: WrapCrossAlignment.center, children: [
+                    if (_step == 3) OutlinedButton.icon(
+                      onPressed: _building ? null : () => _buildAndDownload(requestedFormat: 'web_preview'),
+                      icon: const Icon(Icons.preview_outlined),
+                      label: const Text('Preview Flutter'),
+                    ),
+                    FilledButton.icon(
+                      onPressed: _building ? null : details.onStepContinue,
+                      icon: Icon(_step == 3 ? Icons.rocket_launch_outlined : Icons.arrow_forward),
+                      label: Text(_step == 3 ? (_building ? 'Preparing…' : 'Build ${_buildFormat.toUpperCase()}') : 'Continue'),
+                    ),
                     if (!_building) TextButton(onPressed: details.onStepCancel, child: Text(_step == 0 ? 'Cancel' : 'Back')),
                   ]),
                 ),
@@ -3021,7 +2901,7 @@ jobs:
                       const SizedBox(height: 14),
                       if (_iconBytes != null) Center(child: Container(
                         width: 140, height: 140, padding: const EdgeInsets.all(8),
-                        decoration: BoxDecoration(borderRadius: BorderRadius.circular(18), border: Border.all(color: Theme.of(context).colorScheme.outlineVariant), color: Theme.of(context).colorScheme.surfaceContainerHighest),
+                        decoration: BoxDecoration(borderRadius: BorderRadius.circular(18), border: Border.all(color: Theme.of(context).colorScheme.outlineVariant), color: Colors.white),
                         child: Image.memory(_iconPreviewBytes ?? _iconBytes!, fit: BoxFit.contain,
                           errorBuilder: (context, error, stack) => const Center(child: Text('Image selected\nPreview unavailable', textAlign: TextAlign.center)),
                         ),
@@ -3029,44 +2909,23 @@ jobs:
                       const SizedBox(height: 10),
                       Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() { _iconBytes = null; _iconPreviewBytes = null; }), icon: const Icon(Icons.delete_outline))]),
                       const SizedBox(height: 12),
-                      SwitchListTile(
-                        contentPadding: EdgeInsets.zero,
-                        value: _removeBackground,
-                        title: const Text('Make selected background transparent (if supported)'),
-                        subtitle: const Text('Removes matching pixels from the logo and uses this color as the adaptive icon background.'),
-                        onChanged: (value) async { setState(() => _removeBackground = value); await _refreshIconPreview(); },
-                      ),
-                      if (_removeBackground) ...[
-                        Card(color: Theme.of(context).colorScheme.surfaceContainerLow, child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                          Text('Background color to remove', style: Theme.of(context).textTheme.titleSmall),
-                          const SizedBox(height: 4),
-                          const Text('White by default. Matching color pixels throughout the image become transparent, including white details inside the logo.', style: TextStyle(fontSize: 12)),
-                          const SizedBox(height: 10),
-                          Row(children: [
-                            Container(width: 30, height: 30, decoration: BoxDecoration(color: Color(int.parse('FF${_iconBackgroundColor.substring(1)}', radix: 16)), borderRadius: BorderRadius.circular(6), border: Border.all(color: Theme.of(context).colorScheme.outline))),
-                            const SizedBox(width: 8), Expanded(child: Text(_iconBackgroundColor)),
-                            OutlinedButton(onPressed: _chooseIconBackgroundColor, child: const Text('Choose color')),
+                      Card(
+                        color: Theme.of(context).colorScheme.surfaceContainerLow,
+                        child: const Padding(
+                          padding: EdgeInsets.all(12),
+                          child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                            Icon(Icons.info_outline),
+                            SizedBox(width: 10),
+                            Expanded(child: Text('The selected logo is preserved as-is. No background color is removed or rewritten. Launcher icon assets use a plain white canvas so opaque logos do not unexpectedly turn black.')),
                           ]),
-                          const SizedBox(height: 8),
-                          OutlinedButton.icon(onPressed: _detectingBackground ? null : _detectIconBackgroundColor, icon: _detectingBackground ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.colorize), label: Text(_detectingBackground ? 'Detecting…' : 'Auto-detect edge color')),
-                          const SizedBox(height: 10),
-                          Container(
-                            width: double.infinity,
-                            padding: const EdgeInsets.all(10),
-                            decoration: BoxDecoration(color: const Color(0xFFFFF3E0), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFEF6C00))),
-                            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                              const Icon(Icons.warning_amber_rounded, color: Color(0xFFEF6C00)),
-                              const SizedBox(width: 8),
-                              const Expanded(child: Text('Warning: background removal may damage complex logos, logos with white details, textured backgrounds, gradients, shadows, or non-uniform colors. Use a clean logo on a solid background for best results.', style: TextStyle(fontSize: 12, color: Color(0xFF7A3B00)))),
-                            ]),
-                          ),
-                        ]))),
-                      ],
+                        ),
+                      ),
+                      const SizedBox(height: 8),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
                         value: _dynamicThemedIcon,
                         title: const Text('Use dynamic themed icon (if supported)'),
-                        subtitle: const Text('Adds Android 13+ monochrome launcher artwork. A compatible launcher and the system themed-icons option are required.'),
+                        subtitle: const Text('Adds a themed monochrome icon only when the selected image already includes transparency. Opaque logos are left intact and use a white launcher background.'),
                         onChanged: (value) { setState(() => _dynamicThemedIcon = value); },
                       ),
                     ]),
@@ -3098,40 +2957,52 @@ jobs:
                       )),
                       const SizedBox(height: 14),
                       Row(children: [
-                        Expanded(child: Text('Project file tree · ${_folders.length} folders · ${_additionalFiles.length + 1} Dart files', style: Theme.of(context).textTheme.titleMedium)),
-                        PopupMenuButton<String>(
-                          tooltip: 'Create folder or file',
-                          onSelected: (value) { if (value == 'folder') _createFolder(); if (value == 'file') _addDartFile(); },
-                          itemBuilder: (_) => const [
-                            PopupMenuItem(value: 'folder', child: ListTile(dense: true, leading: Icon(Icons.create_new_folder_outlined), title: Text('Create folder'))),
-                            PopupMenuItem(value: 'file', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Add Dart file'))),
-                          ],
-                        ),
+                        Expanded(child: Text('Project files', style: Theme.of(context).textTheme.titleMedium)),
+                        Text('${_allDartFiles().length} files', style: Theme.of(context).textTheme.bodySmall),
                       ]),
                       const SizedBox(height: 8),
-                      ...(_folders.toList()..sort()).map((folder) => Card(
-                        margin: const EdgeInsets.only(bottom: 6),
-                        child: ListTile(
-                          leading: const Icon(Icons.folder_outlined),
-                          title: Text(folder, maxLines: 1, overflow: TextOverflow.ellipsis),
-                          subtitle: Text('${_additionalFiles.keys.where((file) => file.startsWith('$folder/')).length} file(s) in this folder'),
-                          trailing: PopupMenuButton<String>(
-                            tooltip: 'Manage $folder',
-                            onSelected: (action) {
-                              if (action == 'add') _addDartFile(initialPath: '$folder/new_file.dart');
-                              if (action == 'rename') _renameFolder(folder);
-                              if (action == 'delete') _deleteFolder(folder);
-                            },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(value: 'add', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Add Dart file here'))),
-                              PopupMenuItem(value: 'rename', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename folder'))),
-                              PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete folder and files'))),
-                            ],
+                      Card(
+                        margin: EdgeInsets.zero,
+                        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(4, 4, 12, 4),
+                            child: Row(children: [
+                              IconButton(
+                                tooltip: 'Go to parent folder',
+                                onPressed: _currentFolder == 'lib' ? null : _goToParentFolder,
+                                icon: const Icon(Icons.arrow_upward),
+                              ),
+                              const Icon(Icons.folder_open_outlined, size: 20),
+                              const SizedBox(width: 8),
+                              Expanded(child: Text(_currentFolder == 'lib' ? 'lib · Project root' : _currentFolder.split('/').skip(1).join(' / '), maxLines: 1, overflow: TextOverflow.ellipsis, style: Theme.of(context).textTheme.titleSmall)),
+                              IconButton(tooltip: 'Create folder here', onPressed: _building ? null : () => _createFolder(), icon: const Icon(Icons.create_new_folder_outlined)),
+                              IconButton(tooltip: 'Create Dart file here', onPressed: _building ? null : () => _addDartFile(), icon: const Icon(Icons.note_add_outlined)),
+                            ]),
                           ),
-                        ),
-                      )),
-                      _fileTile('lib/main.dart', isMain: true),
-                      ..._sortedAdditionalPaths.map((path) => _fileTile(path, isMain: false)),
+                          const Divider(height: 1),
+                          if (_visibleFolders.isEmpty && _visibleFiles.isEmpty)
+                            const Padding(padding: EdgeInsets.all(20), child: Column(children: [Icon(Icons.folder_open, size: 38), SizedBox(height: 8), Text('This folder is empty.'), Text('Create a folder or Dart file to get started.', style: TextStyle(fontSize: 12))]))
+                          else ...[
+                            ..._visibleFolders.map((folder) => ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.folder, color: Color(0xFFCA9A32)),
+                              title: Text(folder.split('/').last),
+                              subtitle: Text('${_additionalFiles.keys.where((file) => file.startsWith('$folder/')).length} file(s) below'),
+                              trailing: PopupMenuButton<String>(
+                                tooltip: 'Folder actions',
+                                onSelected: (action) { if (action == 'rename') _renameFolder(folder); if (action == 'delete') _deleteFolder(folder); if (action == 'new_file') { setState(() => _currentFolder = folder); _addDartFile(); } },
+                                itemBuilder: (_) => const [
+                                  PopupMenuItem(value: 'new_file', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Create file inside'))),
+                                  PopupMenuItem(value: 'rename', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename folder'))),
+                                  PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete folder'))),
+                                ],
+                              ),
+                              onTap: () => _openFolder(folder),
+                            )),
+                            ..._visibleFiles.map((path) => _fileTile(path, isMain: path == 'lib/main.dart')),
+                          ],
+                        ]),
+                      ),
                       const SizedBox(height: 4),
                       Wrap(spacing: 8, runSpacing: 8, children: [
                         OutlinedButton.icon(onPressed: _building ? null : _importMainDart, icon: const Icon(Icons.file_open), label: const Text('Import one .dart file')),
@@ -3419,13 +3290,18 @@ jobs:
                 appBar: AppBar(title: Text(widget.title), actions: [IconButton(tooltip: 'Save changes', onPressed: () => Navigator.pop(context, _controller.text), icon: const Icon(Icons.check))]),
                 body: CodeTheme(
                   data: CodeThemeData(styles: dark ? monokaiSublimeTheme : githubTheme),
-                  child: CodeField(
-                    controller: _controller,
-                    expands: true,
-                    wrap: false,
-                    padding: const EdgeInsets.all(16),
-                    textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45),
-                    gutterStyle: GutterStyle(showLineNumbers: true, showErrors: false, showFoldingHandles: true, width: 54, margin: 12),
+                  child: Directionality(
+                    // Code and line numbers must remain left-to-right even on Hebrew/RTL devices.
+                    textDirection: TextDirection.ltr,
+                    child: CodeField(
+                      controller: _controller,
+                      expands: true,
+                      wrap: false,
+                      padding: const EdgeInsets.all(16),
+                      textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45),
+                      gutterStyle: GutterStyle(showLineNumbers: true, showErrors: false, showFoldingHandles: false, textAlign: TextAlign.end, textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45), width: 72, margin: 8),
+                      lineNumberBuilder: (lineNumber, style) => TextSpan(text: '${lineNumber + 1}', style: style),
+                    ),
                   ),
                 ),
               );
@@ -3439,16 +3315,20 @@ jobs:
               sudo apt-get update -qq
               sudo apt-get install -y python3-pil
             fi
-            python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets" true '#FFFFFF' true
+            python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets" true
             flutter pub add --dev flutter_launcher_icons:^0.14.4
             cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
             image_path: "assets/app_icon.png"
-            adaptive_icon_background: "assets/app_icon_background.png"
+            adaptive_icon_background: "#FFFFFF"
             adaptive_icon_foreground: "assets/app_icon_foreground.png"
-            adaptive_icon_monochrome: "assets/app_icon_monochrome.png"
           ICONCONFIG
+            if [[ -f assets/app_icon_monochrome.png ]]; then
+              printf '  adaptive_icon_monochrome: "assets/app_icon_monochrome.png"\n' >> pubspec.yaml
+            else
+              echo '::warning::logo.png is not a transparent logo; themed monochrome icons were skipped to avoid tinting a white rectangle.'
+            fi
             dart run flutter_launcher_icons
           else
             echo "::warning::logo.png was not found at the repository root; using Flutter's default launcher icon."
@@ -3482,10 +3362,6 @@ jobs:
           SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
           SOURCE_ARCHIVE_PATH: ${{ github.workspace }}/.simple-app-builder/source.zip
           DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
-          ICON_PATH: ${{ github.event.client_payload.icon_path }}
-          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
-          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
-          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3591,14 +3467,12 @@ jobs:
           python3 "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" "$TARGET_DIR"
 
       - name: Apply selected image or repository logo.png to Android launcher icons
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format != 'web_preview' }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format != 'web_preview' }}
         shell: bash
         env:
-          ICON_PATH: ${{ github.event.client_payload.icon_path }}
-          HAS_CUSTOM_ICON: ${{ github.event.client_payload.has_custom_icon }}
-          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
-          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
-          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
+          ICON_PATH: ${{ github.event.client_payload.icon.path }}
+          HAS_CUSTOM_ICON: ${{ github.event.client_payload.icon.custom }}
+          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.options.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3617,7 +3491,7 @@ jobs:
             ICON_SOURCE="$GITHUB_WORKSPACE/logo.png"
             echo 'No project-specific icon was selected; using repository-root logo.png as the fallback.'
           else
-            echo 'No project-specific icon and no logo.png fallback were found; keeping Flutter launcher icons.'
+            echo 'No project icon and no logo.png fallback were found; keeping Flutter launcher icons.'
             exit 0
           fi
           if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
@@ -3625,46 +3499,30 @@ jobs:
             sudo apt-get install -y python3-pil
           fi
           mkdir -p "$TARGET_DIR/assets"
-          REMOVE_BACKGROUND="${REMOVE_BACKGROUND:-true}"
-          ICON_BACKGROUND_COLOR="${ICON_BACKGROUND_COLOR:-#FFFFFF}"
           DYNAMIC_THEMED_ICON="${DYNAMIC_THEMED_ICON:-true}"
-          if [[ ! "$ICON_BACKGROUND_COLOR" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
-            echo "ERROR: Invalid icon background color: $ICON_BACKGROUND_COLOR" >&2
-            exit 1
-          fi
-          # When background removal is off, leave the original artwork intact and
-          # use a neutral adaptive background. The monochrome mask still removes white.
-          PROCESS_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
-          ADAPTIVE_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
-          if [[ "${REMOVE_BACKGROUND,,}" == "true" ]]; then
-            # For true transparency, adaptive_icon_background must be a PNG asset,
-            # not a hex color (a hex color necessarily paints a solid square).
-            ADAPTIVE_BACKGROUND_COLOR="assets/app_icon_background.png"
-          else
-            PROCESS_BACKGROUND_COLOR="#FFFFFF"
-            ADAPTIVE_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
-          fi
-          python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets" "$REMOVE_BACKGROUND" "$PROCESS_BACKGROUND_COLOR" "$DYNAMIC_THEMED_ICON"
+          python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets" "$DYNAMIC_THEMED_ICON"
           cd "$TARGET_DIR"
           flutter pub add --dev flutter_launcher_icons:^0.14.4
-          cat >> pubspec.yaml <<ICONCONFIG
+          cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
             android: true
             image_path: "assets/app_icon.png"
-            adaptive_icon_background: "$ADAPTIVE_BACKGROUND_COLOR"
+            adaptive_icon_background: "#FFFFFF"
             adaptive_icon_foreground: "assets/app_icon_foreground.png"
           ICONCONFIG
-          if [[ "${DYNAMIC_THEMED_ICON,,}" == "true" ]]; then
+          if [[ "${DYNAMIC_THEMED_ICON,,}" == "true" && -f assets/app_icon_monochrome.png ]]; then
             printf '  adaptive_icon_monochrome: "assets/app_icon_monochrome.png"\n' >> pubspec.yaml
-            echo 'Dynamic themed icon enabled: Android 13+ monochrome layer will be generated.'
+            echo 'Dynamic themed icon enabled from the original image transparency.'
+          elif [[ "${DYNAMIC_THEMED_ICON,,}" == "true" ]]; then
+            echo '::warning::The selected logo is not transparent, so its colors/background were preserved and a monochrome theme layer was not generated.'
           else
             echo 'Dynamic themed icon disabled by project settings.'
           fi
           dart run flutter_launcher_icons
-          echo 'Applied color, round, and adaptive launcher icons using the selected background options.'
+          echo 'Applied color and adaptive launcher icons. Source colors were preserved; no background removal was performed.'
 
       - name: Configure Android release signing (optional)
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sign_release == true && (github.event.client_payload.build_format == '' || github.event.client_payload.build_format == 'apk' || github.event.client_payload.build_format == 'aab') }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.sign_release == true && (github.event.client_payload.options.build_format == '' || github.event.client_payload.options.build_format == 'apk' || github.event.client_payload.options.build_format == 'aab') }}
         shell: bash
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -3828,8 +3686,8 @@ jobs:
         if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          BUILD_FORMAT: ${{ github.event.client_payload.build_format }}
-          SIGN_RELEASE: ${{ github.event.client_payload.sign_release }}
+          BUILD_FORMAT: ${{ github.event.client_payload.options.build_format }}
+          SIGN_RELEASE: ${{ github.event.client_payload.options.sign_release }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -3855,7 +3713,7 @@ jobs:
           esac
 
       - name: Upload generated release APK
-        if: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.build_format == '' || github.event.client_payload.build_format == 'apk') }}
+        if: ${{ github.event_name == 'repository_dispatch' && (github.event.client_payload.options.build_format == '' || github.event.client_payload.options.build_format == 'apk') }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-apk-${{ steps.metadata.outputs.slug }}
@@ -3865,7 +3723,7 @@ jobs:
           compression-level: 0
 
       - name: Upload generated Android App Bundle
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format == 'aab' }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format == 'aab' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-aab-${{ steps.metadata.outputs.slug }}
@@ -3875,7 +3733,7 @@ jobs:
           compression-level: 0
 
       - name: Upload generated Flutter Web preview
-        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.build_format == 'web_preview' }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.options.build_format == 'web_preview' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-web-${{ steps.metadata.outputs.slug }}
