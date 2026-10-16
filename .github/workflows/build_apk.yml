@@ -134,11 +134,11 @@ jobs:
           BUILDER_PACKAGE="${BUILDER_ORG}.simple_app_builder"
           flutter create --org "$BUILDER_ORG" --project-name simple_app_builder "$BUILDER_DIR"
           cd "$BUILDER_DIR"
-          # Pin compatible APIs. dynamic_color 2.x currently exposes material_ui color types
-          # incompatible with Flutter Material ColorScheme in this app, and file_picker 10.3.9+
-          # removed FilePicker.platform used by the picker/save dialogs below.
+          # Pin APIs that match this embedded source. dynamic_color 1.8.1 uses Flutter's
+          # Material ColorScheme types. file_picker 12.3.0 uses static FilePicker.pickFile/
+          # saveFile methods and win32 6.x, compatible with flutter_secure_storage 11.x.
           flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher
-          flutter pub add dynamic_color:1.8.1 file_picker:10.3.8
+          flutter pub add dynamic_color:1.8.1 file_picker:12.3.0
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
@@ -146,7 +146,7 @@ jobs:
           text = pubspec.read_text(encoding='utf-8')
           replacements = {
               'dynamic_color': '1.8.1',
-              'file_picker': '10.3.8',
+              'file_picker': '12.3.0',
           }
           for package, version in replacements.items():
               pattern = rf'(?m)^  {re.escape(package)}:\s*.*$'
@@ -1077,19 +1077,21 @@ jobs:
             void _message(String message) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message))); }
 
             Future<void> _pickIcon() async {
-              final picked = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: false, withData: true);
-              if (picked == null || picked.files.isEmpty) return;
-              final file = picked.files.single;
-              if (file.bytes == null) { _message('Could not read this image file. Try a PNG image.'); return; }
-              if (file.bytes!.length > 8 * 1024 * 1024) { _message('Choose an image smaller than 8 MB.'); return; }
-              setState(() => _iconBytes = file.bytes);
+              // file_picker 12 returns one PlatformFile from pickFile(); read bytes via
+              // PlatformFile.readAsBytes() so this works with Android document-provider URIs.
+              final picked = await FilePicker.pickFile(type: FileType.image);
+              if (picked == null) return;
+              final bytes = await picked.readAsBytes();
+              if (bytes.isEmpty) { _message('Could not read this image file. Try a PNG image.'); return; }
+              if (bytes.length > 8 * 1024 * 1024) { _message('Choose an image smaller than 8 MB.'); return; }
+              setState(() => _iconBytes = bytes);
             }
 
             Future<void> _pickDartFile() async {
-              final picked = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: const ['dart'], allowMultiple: false, withData: true);
-              if (picked == null || picked.files.isEmpty) return;
-              final bytes = picked.files.single.bytes;
-              if (bytes == null) { _message('Could not read that file.'); return; }
+              final picked = await FilePicker.pickFile(type: FileType.custom, allowedExtensions: const ['dart']);
+              if (picked == null) return;
+              final bytes = await picked.readAsBytes();
+              if (bytes.isEmpty) { _message('Could not read that file.'); return; }
               setState(() => _dartCode = utf8.decode(bytes, allowMalformed: true));
             }
 
@@ -1147,9 +1149,10 @@ jobs:
                 if (apk == null) throw Exception('The artifact ZIP did not contain an APK file.');
                 final apkBytes = Uint8List.fromList(apk.content as List<int>);
                 final safeName = _name.text.trim().replaceAll(RegExp(r'[^A-Za-z0-9_-]+'), '-').replaceAll(RegExp(r'-+'), '-').replaceAll(RegExp(r'^-|-$'), '');
-                final output = await FilePicker.platform.saveFile(
+                final output = await FilePicker.saveFile(
                   dialogTitle: 'Save your release APK',
                   fileName: '${safeName.isEmpty ? 'generated_app' : safeName}.apk',
+                  mimeType: 'application/vnd.android.package-archive',
                   type: FileType.custom,
                   allowedExtensions: const ['apk'],
                   bytes: apkBytes,
