@@ -134,7 +134,27 @@ jobs:
           BUILDER_PACKAGE="${BUILDER_ORG}.simple_app_builder"
           flutter create --org "$BUILDER_ORG" --project-name simple_app_builder "$BUILDER_DIR"
           cd "$BUILDER_DIR"
-          flutter pub add dynamic_color flutter_secure_storage shared_preferences http file_picker flutter_code_editor flutter_highlight highlight archive url_launcher
+          # Pin compatible APIs. dynamic_color 2.x currently exposes material_ui color types
+          # incompatible with Flutter Material ColorScheme in this app, and file_picker 10.3.9+
+          # removed FilePicker.platform used by the picker/save dialogs below.
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher
+          flutter pub add dynamic_color:1.8.1 file_picker:10.3.8
+          python3 - <<'PYDEPS'
+          from pathlib import Path
+          import re
+          pubspec = Path('pubspec.yaml')
+          text = pubspec.read_text(encoding='utf-8')
+          replacements = {
+              'dynamic_color': '1.8.1',
+              'file_picker': '10.3.8',
+          }
+          for package, version in replacements.items():
+              pattern = rf'(?m)^  {re.escape(package)}:\s*.*$'
+              text, count = re.subn(pattern, f'  {package}: {version}', text, count=1)
+              if count != 1:
+                  raise SystemExit(f'Could not pin {package} in pubspec.yaml')
+          pubspec.write_text(text, encoding='utf-8')
+          PYDEPS
           python3 "$RUNNER_TEMP/patch_android_project.py" "$BUILDER_DIR" 'Simple App Builder' "$BUILDER_PACKAGE"
           cat > lib/main.dart <<'DART'
           import 'dart:async';
@@ -568,9 +588,15 @@ jobs:
 
             @override
             Widget build(BuildContext context) => DynamicColorBuilder(
-                  builder: (lightDynamic, darkDynamic) {
-                    final light = lightDynamic ?? ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4));
-                    final dark = darkDynamic ?? ColorScheme.fromSeed(seedColor: const Color(0xFFD0BCFF), brightness: Brightness.dark);
+                  builder: (ColorScheme? lightDynamic, ColorScheme? darkDynamic) {
+                    // Explicit types prevent inference from widening the values to Diagnosticable.
+                    final ColorScheme light = lightDynamic ??
+                        ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4));
+                    final ColorScheme dark = darkDynamic ??
+                        ColorScheme.fromSeed(
+                          seedColor: const Color(0xFFD0BCFF),
+                          brightness: Brightness.dark,
+                        );
                     return MaterialApp(
                       title: 'Simple App Builder',
                       debugShowCheckedModeBanner: false,
