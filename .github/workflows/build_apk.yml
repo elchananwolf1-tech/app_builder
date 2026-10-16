@@ -33,6 +33,9 @@ jobs:
           DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
           HAS_CUSTOM_ICON: ${{ github.event.client_payload.has_custom_icon }}
           ICON_PATH: ${{ github.event.client_payload.icon_path }}
+          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
+          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
+          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -60,6 +63,13 @@ jobs:
                   sys.exit('Custom icon path is missing or invalid. Select the icon again and retry.')
           if bundle and not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle):
               sys.exit('source_archive_base64 contains invalid characters.')
+          bg = os.environ.get('ICON_BACKGROUND_COLOR', '').strip() or '#FFFFFF'
+          if not re.fullmatch(r'#[0-9A-Fa-f]{6}', bg):
+              sys.exit('icon_background_color must be a six-digit hex color such as #FFFFFF.')
+          if (os.environ.get('REMOVE_BACKGROUND', '').lower() or 'true') not in ('true', 'false'):
+              sys.exit('remove_background must be true or false.')
+          if (os.environ.get('DYNAMIC_THEMED_ICON', '').lower() or 'true') not in ('true', 'false'):
+              sys.exit('dynamic_themed_icon must be true or false.')
           if len(source.encode('utf-8')) > 50000:
               sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
           for dep in re.split(r'[,;\s]+', deps.strip()):
@@ -137,95 +147,96 @@ jobs:
           gradle.write_text(data, encoding='utf-8')
           PY
           cat > "$RUNNER_TEMP/prepare_launcher_icons.py" <<'PYICON'
-          import math, sys
-          from collections import deque
+          import math, re, sys
           from pathlib import Path
           from PIL import Image, ImageOps
 
           source_path = Path(sys.argv[1])
           output_dir = Path(sys.argv[2])
+          remove_background = len(sys.argv) > 3 and sys.argv[3].lower() == 'true'
+          background_hex = sys.argv[4] if len(sys.argv) > 4 else '#FFFFFF'
+          dynamic_icon = len(sys.argv) <= 5 or sys.argv[5].lower() == 'true'
+          if not re.fullmatch(r'#[0-9A-Fa-f]{6}', background_hex):
+              raise SystemExit('Background color must be a six-digit hex color such as #FFFFFF.')
+          target = tuple(int(background_hex[i:i+2], 16) for i in (1, 3, 5))
           output_dir.mkdir(parents=True, exist_ok=True)
+
           try:
-              opened = Image.open(source_path)
-              if opened.width < 1 or opened.height < 1 or opened.width * opened.height > 40000000:
-                  raise ValueError(f'unsupported image dimensions {opened.width}x{opened.height}; maximum is 40 megapixels')
-              image = ImageOps.exif_transpose(opened).convert('RGBA')
+              with Image.open(source_path) as opened:
+                  image = ImageOps.exif_transpose(opened).convert('RGBA')
           except Exception as exc:
               raise SystemExit(f'Could not decode launcher image {source_path}: {exc}')
+          if image.width < 1 or image.height < 1 or image.width * image.height > 40000000:
+              raise SystemExit(f'Unsupported launcher image dimensions {image.width}x{image.height}; maximum is 40 megapixels.')
           image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-          if image.width < 1 or image.height < 1:
-              raise SystemExit('Launcher image has zero dimensions.')
 
-          # The legacy/color icon uses a neutral white tile. Adaptive and themed icons
-          # use a separate transparent silhouette, which is what Android can tint.
-          color_canvas = Image.new('RGBA', (1024, 1024), (255, 255, 255, 255))
-          color_image = image.copy()
-          visible_color_bbox = color_image.getchannel('A').getbbox()
-          if visible_color_bbox is not None:
-              color_image = color_image.crop(visible_color_bbox)
-          color_image.thumbnail((768, 768), Image.Resampling.LANCZOS)
-          color_canvas.alpha_composite(color_image, ((1024 - color_image.width) // 2, (1024 - color_image.height) // 2))
-          color_canvas.convert('RGB').save(output_dir / 'app_icon.png', format='PNG', optimize=True)
+          def remove_color_background(source, rgb, tolerance=28, feather=48):
+              result = source.copy()
+              px = result.load()
+              width, height = result.size
+              changed = 0
+              for y in range(height):
+                  for x in range(width):
+                      r, g, b, alpha = px[x, y]
+                      if alpha <= 0:
+                          continue
+                      distance = math.sqrt((r-rgb[0])**2 + (g-rgb[1])**2 + (b-rgb[2])**2)
+                      if distance <= tolerance:
+                          px[x, y] = (r, g, b, 0)
+                          changed += 1
+                      elif distance <= tolerance + feather:
+                          new_alpha = round(alpha * (distance - tolerance) / feather)
+                          px[x, y] = (r, g, b, max(0, min(255, new_alpha)))
+                          changed += 1
+              if changed == 0:
+                  print('WARNING: No pixels closely matched the selected background color; the logo may have a non-uniform or different background.', file=sys.stderr)
+              return result
 
-          foreground = image.copy()
-          alpha = foreground.getchannel('A')
-          if alpha.getextrema() == (255, 255):
-              # Opaque source? Try to remove a flat background connected to the image
-              # edges (typically white, black or a brand-color canvas). Complex/photo
-              # backgrounds cannot be separated reliably; transparent source images are best.
-              px = foreground.load()
-              w, h = foreground.size
-              samples = [px[0, 0][:3], px[w - 1, 0][:3], px[0, h - 1][:3], px[w - 1, h - 1][:3]]
-              bg = tuple(round(sum(c[i] for c in samples) / len(samples)) for i in range(3))
-              corner_spread = max(math.sqrt(sum((c[i] - bg[i]) ** 2 for i in range(3))) for c in samples)
-              if corner_spread <= 55:
-                  threshold = 62.0
-                  seen = bytearray(w * h)
-                  queue = deque()
-                  def distance(x, y):
-                      c = px[x, y]
-                      return math.sqrt((c[0] - bg[0]) ** 2 + (c[1] - bg[1]) ** 2 + (c[2] - bg[2]) ** 2)
-                  def enqueue(x, y):
-                      idx = y * w + x
-                      if not seen[idx] and distance(x, y) <= threshold:
-                          seen[idx] = 1
-                          queue.append((x, y))
-                  for x in range(w):
-                      enqueue(x, 0)
-                      enqueue(x, h - 1)
-                  for y in range(h):
-                      enqueue(0, y)
-                      enqueue(w - 1, y)
-                  while queue:
-                      x, y = queue.popleft()
-                      d = distance(x, y)
-                      old = px[x, y]
-                      # Gentle edge alpha preserves anti-aliased contours rather than
-                      # leaving a hard rectangle around a logo on a flat background.
-                      new_alpha = round(old[3] * max(0.0, min(1.0, (d - 8.0) / (threshold - 8.0))))
-                      px[x, y] = (old[0], old[1], old[2], new_alpha)
-                      if x > 0: enqueue(x - 1, y)
-                      if x + 1 < w: enqueue(x + 1, y)
-                      if y > 0: enqueue(x, y - 1)
-                      if y + 1 < h: enqueue(x, y + 1)
-              else:
-                  print('WARNING: logo has a complex opaque background; automatic monochrome extraction may include it. A transparent-background logo.png is recommended.', file=sys.stderr)
+          # Color/legacy icon. If the option is enabled, every pixel near the selected
+          # background color is made transparent (not only pixels connected to the edges).
+          color_source = remove_color_background(image, target) if remove_background else image.copy()
+          color_bbox = color_source.getchannel('A').getbbox()
+          if color_bbox is None:
+              # Avoid failing the whole APK build for a logo that is entirely the chosen
+              # background color. Preserve the original artwork and warn instead.
+              print('WARNING: background removal would make the entire logo transparent; preserving the original image for the color icon. Choose a more accurate background color to remove the backdrop.', file=sys.stderr)
+              color_source = image.copy()
+              color_bbox = color_source.getchannel('A').getbbox()
+          if color_bbox is None:
+              raise SystemExit('The selected image is fully transparent. Choose a different logo image.')
+          color_source = color_source.crop(color_bbox)
+          color_source.thumbnail((768, 768), Image.Resampling.LANCZOS)
+          color_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+          color_canvas.alpha_composite(color_source, ((1024-color_source.width)//2, (1024-color_source.height)//2))
+          color_canvas.save(output_dir / 'app_icon.png', format='PNG', optimize=True)
 
-          bbox = foreground.getchannel('A').getbbox()
-          if bbox is None:
-              raise SystemExit('Could not detect visible logo pixels after background processing. Use a logo with a transparent background or a clear solid background.')
-          foreground = foreground.crop(bbox)
-          foreground.thumbnail((768, 768), Image.Resampling.LANCZOS)
-          foreground_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
-          foreground_canvas.alpha_composite(foreground, ((1024 - foreground.width) // 2, (1024 - foreground.height) // 2))
+          # Adaptive foreground uses the same cut-out setting as the color/legacy icon.
+          foreground_canvas = color_canvas.copy()
           foreground_canvas.save(output_dir / 'app_icon_foreground.png', format='PNG', optimize=True)
 
-          # Android 13+ themed icons use the alpha silhouette as a mask. The system
-          # applies its own theme color; RGB is deliberately white and transparent elsewhere.
-          monochrome = Image.new('RGBA', (1024, 1024), (255, 255, 255, 0))
-          monochrome.putalpha(foreground_canvas.getchannel('A'))
-          monochrome.save(output_dir / 'app_icon_monochrome.png', format='PNG', optimize=True)
-          print('Generated color, adaptive foreground, and monochrome themed launcher icon assets.')
+          if dynamic_icon:
+              # A themed icon is a white silhouette with alpha transparency. The launcher
+              # uses alpha as a mask and supplies its own theme tint, so no white square is added.
+              themed_source = remove_color_background(image, target)
+              themed_bbox = themed_source.getchannel('A').getbbox()
+              if themed_bbox is None:
+                  # A plain white/dark logo can match the selected removal color completely.
+                  # Keep the original alpha silhouette as a fallback so that an optional
+                  # themed icon does not cause an otherwise valid APK build to fail.
+                  print('WARNING: selected background color removed the whole themed icon; using the image alpha silhouette as a fallback.', file=sys.stderr)
+                  themed_source = image.copy()
+                  themed_bbox = themed_source.getchannel('A').getbbox()
+              if themed_bbox is None:
+                  raise SystemExit('The selected image is fully transparent; a themed icon cannot be generated.')
+              themed_source = themed_source.crop(themed_bbox)
+              themed_source.thumbnail((768, 768), Image.Resampling.LANCZOS)
+              themed_canvas = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+              alpha = themed_source.getchannel('A')
+              white = Image.new('RGBA', themed_source.size, (255, 255, 255, 0))
+              white.putalpha(alpha)
+              themed_canvas.alpha_composite(white, ((1024-white.width)//2, (1024-white.height)//2))
+              themed_canvas.save(output_dir / 'app_icon_monochrome.png', format='PNG', optimize=True)
+          print(f'Generated launcher images; remove_background={remove_background}, background={background_hex}, dynamic_themed_icon={dynamic_icon}.')
           PYICON
 
       - name: Generate the real Simple App Builder application
@@ -243,7 +254,7 @@ jobs:
           # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
           # selected above supplies the current compatible SDK. cross_file 0.3.x is required
           # by both plugins; do not let Pub select the incompatible 0.4.x line.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0
+          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.8.1 file_picker:12.3.0 image:^4.12.0
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
@@ -254,7 +265,8 @@ jobs:
               'file_picker': '^12.3.0',
               'share_plus': '^13.3.1',
               'cross_file': '^0.3.5+4',
-          }
+              'image': '^4.12.0',
+            }
           for package, version in replacements.items():
               pattern = rf'(?m)^  {re.escape(package)}:\s*.*$'
               text, count = re.subn(pattern, f'  {package}: {version}', text, count=1)
@@ -267,12 +279,14 @@ jobs:
           import 'dart:async';
           import 'dart:convert';
           import 'dart:io';
+          import 'dart:math' as math;
           import 'dart:typed_data';
 
           import 'package:archive/archive.dart';
           import 'package:cross_file/cross_file.dart';
           import 'package:dynamic_color/dynamic_color.dart';
           import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/foundation.dart' show compute;
           import 'package:flutter/material.dart';
           import 'package:flutter_code_editor/flutter_code_editor.dart';
           import 'package:flutter_highlight/themes/github.dart';
@@ -281,6 +295,7 @@ jobs:
           import 'package:highlight/languages/dart.dart' as dart_language;
           import 'package:highlight/languages/yaml.dart' as yaml_language;
           import 'package:http/http.dart' as http;
+          import 'package:image/image.dart' as img;
           import 'package:open_filex/open_filex.dart';
           import 'package:path_provider/path_provider.dart';
           import 'package:share_plus/share_plus.dart';
@@ -293,6 +308,73 @@ jobs:
           );
           const String workflowFile = 'build_apk.yml';
           const FlutterSecureStorage secureStorage = FlutterSecureStorage();
+
+          String _normaliseLauncherHex(String value) {
+            var raw = value.trim().replaceAll('#', '').toUpperCase();
+            if (RegExp(r'^[0-9A-F]{3}$').hasMatch(raw)) raw = raw.split('').map((c) => '$c$c').join();
+            return RegExp(r'^[0-9A-F]{6}$').hasMatch(raw) ? '#$raw' : '#FFFFFF';
+          }
+
+          void _removeLauncherBackground(img.Image image, String hex, {int tolerance = 32}) {
+            final clean = _normaliseLauncherHex(hex).substring(1);
+            final tr = int.parse(clean.substring(0, 2), radix: 16);
+            final tg = int.parse(clean.substring(2, 4), radix: 16);
+            final tb = int.parse(clean.substring(4, 6), radix: 16);
+            for (final pixel in image) {
+              if (pixel.a <= 0) continue;
+              final dr = pixel.r.toDouble() - tr, dg = pixel.g.toDouble() - tg, db = pixel.b.toDouble() - tb;
+              final distance = math.sqrt(dr * dr + dg * dg + db * db);
+              if (distance <= tolerance) {
+                pixel.a = 0;
+              } else if (distance <= tolerance + 42) {
+                pixel.a = (pixel.a * ((distance - tolerance) / 42.0)).round().clamp(0, 255);
+              }
+            }
+          }
+
+          Uint8List _buildLauncherIconPreview(Map<String, Object?> args) {
+            final sourceBytes = args['bytes'] as Uint8List;
+            final decoded = img.decodeImage(sourceBytes);
+            if (decoded == null || decoded.width < 1 || decoded.height < 1 || decoded.width * decoded.height > 40000000) {
+              throw Exception('Unsupported or oversized image.');
+            }
+            final scale = 256.0 / math.max(decoded.width, decoded.height);
+            final width = math.max(1, (decoded.width * scale).round()).toInt();
+            final height = math.max(1, (decoded.height * scale).round()).toInt();
+            final preview = scale < 1 ? img.copyResize(decoded, width: width, height: height) : decoded.clone();
+            if (args['removeBackground'] == true) {
+              _removeLauncherBackground(preview, (args['backgroundColor'] ?? '#FFFFFF').toString());
+            }
+            return Uint8List.fromList(img.encodePng(preview));
+          }
+
+          String _detectLauncherBackgroundColor(Uint8List bytes) {
+            final decoded = img.decodeImage(bytes);
+            if (decoded == null || decoded.width < 1 || decoded.height < 1 || decoded.width * decoded.height > 40000000) {
+              throw Exception('The image is unsupported or too large to analyze.');
+            }
+            final buckets = <int, List<int>>{};
+            void sample(int x, int y) {
+              final pixel = decoded.getPixel(x, y);
+              if (pixel.a < 200) return;
+              final r = pixel.r.toInt().clamp(0, 255).toInt();
+              final g = pixel.g.toInt().clamp(0, 255).toInt();
+              final b = pixel.b.toInt().clamp(0, 255).toInt();
+              final key = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+              final stats = buckets.putIfAbsent(key, () => [0, 0, 0, 0]);
+              stats[0] += r; stats[1] += g; stats[2] += b; stats[3]++;
+            }
+            final sx = math.max(1, decoded.width ~/ 128).toInt();
+            final sy = math.max(1, decoded.height ~/ 128).toInt();
+            for (var x = 0; x < decoded.width; x += sx) { sample(x, 0); sample(x, decoded.height - 1); }
+            for (var y = 0; y < decoded.height; y += sy) { sample(0, y); sample(decoded.width - 1, y); }
+            if (buckets.isEmpty) throw Exception('No opaque background pixels were found along the image edges. The image may already have a transparent background.');
+            final best = buckets.values.reduce((a, b) => a[3] >= b[3] ? a : b);
+            final r = (best[0] / best[3]).round().clamp(0, 255).toInt();
+            final g = (best[1] / best[3]).round().clamp(0, 255).toInt();
+            final b = (best[2] / best[3]).round().clamp(0, 255).toInt();
+            return '#${r.toRadixString(16).padLeft(2, '0')}${g.toRadixString(16).padLeft(2, '0')}${b.toRadixString(16).padLeft(2, '0')}'.toUpperCase();
+          }
 
           void main() => runApp(const SimpleAppBuilder());
 
@@ -320,6 +402,9 @@ jobs:
               this.dependencies = '',
               this.iconBase64,
               this.repository = '',
+              this.removeBackground = true,
+              this.iconBackgroundColor = '#FFFFFF',
+              this.dynamicThemedIcon = true,
             });
 
             final String id;
@@ -332,6 +417,12 @@ jobs:
             // Explicit packages supplement packages discovered from Dart imports.
             final String dependencies;
             final String? iconBase64;
+            // Background removal applies to matching pixels across the entire image.
+            final bool removeBackground;
+            // Android adaptive icon background color and color used for automatic cutout.
+            final String iconBackgroundColor;
+            // Android 13+ launcher theme icon support, subject to launcher settings/support.
+            final bool dynamicThemedIcon;
             // Each app has an isolated, private GitHub repository for its source, icon, workflow and artifact.
             final String repository;
 
@@ -343,6 +434,9 @@ jobs:
               String? dependencies,
               String? iconBase64,
               String? repository,
+              bool? removeBackground,
+              String? iconBackgroundColor,
+              bool? dynamicThemedIcon,
               bool clearIcon = false,
             }) => AppProject(
                   id: id,
@@ -353,6 +447,9 @@ jobs:
                   dependencies: dependencies ?? this.dependencies,
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
                   repository: repository ?? this.repository,
+                  removeBackground: removeBackground ?? this.removeBackground,
+                  iconBackgroundColor: iconBackgroundColor ?? this.iconBackgroundColor,
+                  dynamicThemedIcon: dynamicThemedIcon ?? this.dynamicThemedIcon,
                 );
 
             Map<String, dynamic> toJson() => {
@@ -364,6 +461,9 @@ jobs:
                   'dependencies': dependencies,
                   'iconBase64': iconBase64,
                   'repository': repository,
+                  'removeBackground': removeBackground,
+                  'iconBackgroundColor': iconBackgroundColor,
+                  'dynamicThemedIcon': dynamicThemedIcon,
                 };
 
             factory AppProject.fromJson(Map<String, dynamic> json) {
@@ -383,6 +483,9 @@ jobs:
                 dependencies: (json['dependencies'] ?? '').toString(),
                 iconBase64: json['iconBase64']?.toString(),
                 repository: (json['repository'] ?? '').toString(),
+                removeBackground: json['removeBackground'] is bool ? json['removeBackground'] as bool : true,
+                iconBackgroundColor: (json['iconBackgroundColor'] ?? '#FFFFFF').toString(),
+                dynamicThemedIcon: json['dynamicThemedIcon'] is bool ? json['dynamicThemedIcon'] as bool : true,
               );
             }
           }
@@ -775,6 +878,9 @@ jobs:
               required String dependencies,
               required bool hasCustomIcon,
               required String iconPath,
+              required bool removeBackground,
+              required String iconBackgroundColor,
+              required bool dynamicThemedIcon,
               required String requestId,
             }) async {
               // repository_dispatch keeps project fields out of GitHub's static
@@ -787,6 +893,9 @@ jobs:
                   'dependencies': dependencies,
                   'has_custom_icon': hasCustomIcon,
                   'icon_path': iconPath,
+                  'remove_background': removeBackground,
+                  'icon_background_color': iconBackgroundColor,
+                  'dynamic_themed_icon': dynamicThemedIcon,
                   'request_id': requestId,
                 },
               });
@@ -1661,6 +1770,11 @@ jobs:
             late Map<String, String> _additionalFiles;
             String _selectedTemplate = 'Material 3 starter';
             Uint8List? _iconBytes;
+            Uint8List? _iconPreviewBytes;
+            bool _removeBackground = true;
+            String _iconBackgroundColor = '#FFFFFF';
+            bool _dynamicThemedIcon = true;
+            bool _detectingBackground = false;
             int _step = 0;
             bool _building = false;
             String _status = '';
@@ -1699,6 +1813,13 @@ jobs:
               if (widget.existing?.iconBase64 != null) {
                 try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
               }
+              _removeBackground = widget.existing?.removeBackground ?? true;
+              _iconBackgroundColor = _normaliseHex(widget.existing?.iconBackgroundColor ?? '#FFFFFF');
+              _dynamicThemedIcon = widget.existing?.dynamicThemedIcon ?? true;
+              if (_iconBytes != null) {
+                _iconPreviewBytes = _iconBytes;
+                WidgetsBinding.instance.addPostFrameCallback((_) { unawaited(_refreshIconPreview()); });
+              }
             }
 
             @override
@@ -1719,6 +1840,9 @@ jobs:
               dependencies: _dependencies.text.trim(),
               iconBase64: _iconBytes == null ? null : base64Encode(_iconBytes!),
               repository: normalizeRepository(repository ?? (_targetRepository.isNotEmpty ? _targetRepository : (widget.existing?.repository ?? ''))),
+              removeBackground: _removeBackground,
+              iconBackgroundColor: _iconBackgroundColor,
+              dynamicThemedIcon: _dynamicThemedIcon,
             );
 
             Map<String, String> _allDartFiles() => <String, String>{
@@ -1778,13 +1902,88 @@ jobs:
               if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
             }
 
+            String _normaliseHex(String value) => _normaliseLauncherHex(value);
+
+            Future<void> _refreshIconPreview() async {
+              final sourceBytes = _iconBytes;
+              if (sourceBytes == null) {
+                if (mounted) setState(() => _iconPreviewBytes = null);
+                return;
+              }
+              try {
+                final bytes = await compute(_buildLauncherIconPreview, <String, Object?>{
+                  'bytes': sourceBytes,
+                  'removeBackground': _removeBackground,
+                  'backgroundColor': _iconBackgroundColor,
+                });
+                if (mounted && identical(_iconBytes, sourceBytes)) setState(() => _iconPreviewBytes = bytes);
+              } catch (_) {
+                if (mounted && identical(_iconBytes, sourceBytes)) setState(() => _iconPreviewBytes = sourceBytes);
+              }
+            }
+
             Future<void> _pickIcon() async {
               final picked = await FilePicker.pickFile(type: FileType.image);
               if (picked == null) return;
-              final bytes = await picked.readAsBytes();
-              if (bytes.isEmpty) { _message('Could not read this image file. Try a PNG image.'); return; }
-              if (bytes.length > 8 * 1024 * 1024) { _message('Choose an image smaller than 8 MB.'); return; }
-              setState(() => _iconBytes = bytes);
+              try {
+                final bytes = await picked.readAsBytes();
+                if (bytes.isEmpty) { _message('Could not read this image file. Try PNG, JPEG, or WebP.'); return; }
+                if (bytes.length > 8 * 1024 * 1024) { _message('Choose an image smaller than 8 MB.'); return; }
+                final decoded = img.decodeImage(bytes);
+                if (decoded == null || decoded.width * decoded.height > 40000000) { _message('The image is unsupported or exceeds 40 megapixels.'); return; }
+                setState(() => _iconBytes = bytes);
+                await _refreshIconPreview();
+              } catch (error) {
+                _message('Could not open this image: $error');
+              }
+            }
+
+            Future<void> _chooseIconBackgroundColor() async {
+              final controller = TextEditingController(text: _iconBackgroundColor);
+              var chosen = _iconBackgroundColor;
+              const swatches = <String>['#FFFFFF', '#000000', '#F5F5F5', '#ECEFF1', '#FFF3E0', '#E3F2FD', '#E8F5E9', '#FCE4EC', '#673AB7', '#2196F3', '#00897B', '#FFC107'];
+              final result = await showDialog<String>(
+                context: context,
+                builder: (dialogContext) => StatefulBuilder(builder: (context, setDialogState) => AlertDialog(
+                  title: const Text('Background color to remove'),
+                  content: SizedBox(width: 420, child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Choose the color that should become transparent in the logo. The same color is used for the adaptive-icon background.'),
+                    const SizedBox(height: 12),
+                    TextField(controller: controller, decoration: const InputDecoration(labelText: 'Hex color', hintText: '#FFFFFF'), onChanged: (value) { if (RegExp(r'^#?[0-9A-Fa-f]{6}$').hasMatch(value.trim())) setDialogState(() => chosen = _normaliseHex(value)); }),
+                    const SizedBox(height: 12),
+                    Wrap(spacing: 8, runSpacing: 8, children: swatches.map((hex) => InkWell(
+                      borderRadius: BorderRadius.circular(24),
+                      onTap: () { setDialogState(() { chosen = hex; controller.text = hex; }); },
+                      child: Container(width: 36, height: 36, decoration: BoxDecoration(color: Color(int.parse('FF${hex.substring(1)}', radix: 16)), shape: BoxShape.circle, border: Border.all(color: chosen == hex ? Theme.of(context).colorScheme.primary : Theme.of(context).colorScheme.outline, width: chosen == hex ? 3 : 1))),
+                    )).toList()),
+                    const SizedBox(height: 12),
+                    Row(children: [Container(width: 28, height: 28, decoration: BoxDecoration(color: Color(int.parse('FF${chosen.substring(1)}', radix: 16)), borderRadius: BorderRadius.circular(6), border: Border.all(color: Theme.of(context).colorScheme.outline)),), const SizedBox(width: 8), Text(chosen)]),
+                  ])),
+                  actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () { if (RegExp(r'^#[0-9A-Fa-f]{6}$').hasMatch(chosen)) Navigator.pop(dialogContext, chosen.toUpperCase()); }, child: const Text('Use color'))],
+                )),
+              );
+              controller.dispose();
+              if (result == null) return;
+              setState(() => _iconBackgroundColor = _normaliseHex(result));
+              await _refreshIconPreview();
+            }
+
+            Future<void> _detectIconBackgroundColor() async {
+              final bytes = _iconBytes;
+              if (bytes == null) { _message('Choose an image first.'); return; }
+              setState(() => _detectingBackground = true);
+              try {
+                await Future<void>.delayed(const Duration(milliseconds: 120));
+                final hex = await compute(_detectLauncherBackgroundColor, bytes);
+                if (!mounted || !identical(_iconBytes, bytes)) return;
+                setState(() => _iconBackgroundColor = hex);
+                await _refreshIconPreview();
+                _message('Detected edge background color: $hex');
+              } catch (error) {
+                _message('Could not detect the background color: $error');
+              } finally {
+                if (mounted) setState(() => _detectingBackground = false);
+              }
             }
 
             Future<void> _importMainDart() async {
@@ -2119,6 +2318,9 @@ jobs:
                     'dependencies': _dependencies.text.trim(),
                     'has_custom_icon': hasCustomIcon,
                     'icon_path': iconPath,
+                    'remove_background': _removeBackground,
+                    'icon_background_color': _normaliseHex(_iconBackgroundColor),
+                    'dynamic_themed_icon': _dynamicThemedIcon,
                     'request_id': requestId,
                   },
                 })).length;
@@ -2138,6 +2340,9 @@ jobs:
                   dependencies: _dependencies.text.trim(),
                   hasCustomIcon: hasCustomIcon,
                   iconPath: iconPath,
+                  removeBackground: _removeBackground,
+                  iconBackgroundColor: _iconBackgroundColor,
+                  dynamicThemedIcon: _dynamicThemedIcon,
                   requestId: requestId,
                 );
                 final run = await targetApi!.waitForBuild(
@@ -2384,12 +2589,56 @@ jobs:
                     content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       const Text('Select an image from any location available in the Android file picker (PNG, JPEG, WebP, etc.). The workflow normalizes it and generates regular, round, and adaptive Android launcher icons.'),
                       const SizedBox(height: 14),
-                      if (_iconBytes != null) Center(child: ClipRRect(borderRadius: BorderRadius.circular(18), child: Image.memory(
-                        _iconBytes!, width: 112, height: 112, fit: BoxFit.cover,
-                        errorBuilder: (context, error, stack) => Container(width: 112, height: 112, alignment: Alignment.center, padding: const EdgeInsets.all(8), color: Theme.of(context).colorScheme.surfaceContainerHighest, child: const Text('Image selected\nPreview unavailable', textAlign: TextAlign.center)),
-                      ))) else const Center(child: Icon(Icons.image_outlined, size: 80)),
+                      if (_iconBytes != null) Center(child: Container(
+                        width: 140, height: 140, padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(borderRadius: BorderRadius.circular(18), border: Border.all(color: Theme.of(context).colorScheme.outlineVariant), color: Theme.of(context).colorScheme.surfaceContainerHighest),
+                        child: Image.memory(_iconPreviewBytes ?? _iconBytes!, fit: BoxFit.contain,
+                          errorBuilder: (context, error, stack) => const Center(child: Text('Image selected\nPreview unavailable', textAlign: TextAlign.center)),
+                        ),
+                      )) else const Center(child: Icon(Icons.image_outlined, size: 80)),
                       const SizedBox(height: 10),
-                      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() => _iconBytes = null), icon: const Icon(Icons.delete_outline))]),
+                      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() { _iconBytes = null; _iconPreviewBytes = null; }), icon: const Icon(Icons.delete_outline))]),
+                      const SizedBox(height: 12),
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _removeBackground,
+                        title: const Text('Make selected background transparent (if supported)'),
+                        subtitle: const Text('Removes matching pixels from the logo and uses this color as the adaptive icon background.'),
+                        onChanged: (value) async { setState(() => _removeBackground = value); await _refreshIconPreview(); },
+                      ),
+                      if (_removeBackground) ...[
+                        Card(color: Theme.of(context).colorScheme.surfaceContainerLow, child: Padding(padding: const EdgeInsets.all(12), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('Background color to remove', style: Theme.of(context).textTheme.titleSmall),
+                          const SizedBox(height: 4),
+                          const Text('White by default. Matching color pixels throughout the image become transparent, including white details inside the logo.', style: TextStyle(fontSize: 12)),
+                          const SizedBox(height: 10),
+                          Row(children: [
+                            Container(width: 30, height: 30, decoration: BoxDecoration(color: Color(int.parse('FF${_iconBackgroundColor.substring(1)}', radix: 16)), borderRadius: BorderRadius.circular(6), border: Border.all(color: Theme.of(context).colorScheme.outline))),
+                            const SizedBox(width: 8), Expanded(child: Text(_iconBackgroundColor)),
+                            OutlinedButton(onPressed: _chooseIconBackgroundColor, child: const Text('Choose color')),
+                          ]),
+                          const SizedBox(height: 8),
+                          OutlinedButton.icon(onPressed: _detectingBackground ? null : _detectIconBackgroundColor, icon: _detectingBackground ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.colorize), label: Text(_detectingBackground ? 'Detecting…' : 'Auto-detect edge color')),
+                          const SizedBox(height: 10),
+                          Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(color: const Color(0xFFFFF3E0), borderRadius: BorderRadius.circular(8), border: Border.all(color: const Color(0xFFEF6C00))),
+                            child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                              const Icon(Icons.warning_amber_rounded, color: Color(0xFFEF6C00)),
+                              const SizedBox(width: 8),
+                              const Expanded(child: Text('Warning: background removal may damage complex logos, logos with white details, textured backgrounds, gradients, shadows, or non-uniform colors. Use a clean logo on a solid background for best results.', style: TextStyle(fontSize: 12, color: Color(0xFF7A3B00)))),
+                            ]),
+                          ),
+                        ]))),
+                      ],
+                      SwitchListTile(
+                        contentPadding: EdgeInsets.zero,
+                        value: _dynamicThemedIcon,
+                        title: const Text('Use dynamic themed icon (if supported)'),
+                        subtitle: const Text('Adds Android 13+ monochrome launcher artwork. A compatible launcher and the system themed-icons option are required.'),
+                        onChanged: (value) { setState(() => _dynamicThemedIcon = value); },
+                      ),
                     ]),
                   ),
                   Step(
@@ -2547,7 +2796,7 @@ jobs:
           if [[ -f "$GITHUB_WORKSPACE/logo.png" ]]; then
             sudo apt-get update -qq
             sudo apt-get install -y python3-pil
-            python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets"
+            python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$GITHUB_WORKSPACE/logo.png" "$BUILDER_DIR/assets" true '#FFFFFF' true
             flutter pub add --dev flutter_launcher_icons:^0.14.4
             cat >> pubspec.yaml <<'ICONCONFIG'
           flutter_launcher_icons:
@@ -2590,6 +2839,9 @@ jobs:
           SOURCE_ARCHIVE_PATH: ${{ github.workspace }}/.simple-app-builder/source.zip
           DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
           ICON_PATH: ${{ github.event.client_payload.icon_path }}
+          REMOVE_BACKGROUND: ${{ github.event.client_payload.remove_background }}
+          ICON_BACKGROUND_COLOR: ${{ github.event.client_payload.icon_background_color }}
+          DYNAMIC_THEMED_ICON: ${{ github.event.client_payload.dynamic_themed_icon }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -2719,19 +2971,39 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y python3-pil
           mkdir -p "$TARGET_DIR/assets"
-          python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets"
+          REMOVE_BACKGROUND="${REMOVE_BACKGROUND:-true}"
+          ICON_BACKGROUND_COLOR="${ICON_BACKGROUND_COLOR:-#FFFFFF}"
+          DYNAMIC_THEMED_ICON="${DYNAMIC_THEMED_ICON:-true}"
+          if [[ ! "$ICON_BACKGROUND_COLOR" =~ ^#[0-9A-Fa-f]{6}$ ]]; then
+            echo "ERROR: Invalid icon background color: $ICON_BACKGROUND_COLOR" >&2
+            exit 1
+          fi
+          # When background removal is off, leave the original artwork intact and
+          # use a neutral adaptive background. The monochrome mask still removes white.
+          PROCESS_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
+          ADAPTIVE_BACKGROUND_COLOR="$ICON_BACKGROUND_COLOR"
+          if [[ "${REMOVE_BACKGROUND,,}" != "true" ]]; then
+            PROCESS_BACKGROUND_COLOR="#FFFFFF"
+            ADAPTIVE_BACKGROUND_COLOR="#FFFFFF"
+          fi
+          python3 "$RUNNER_TEMP/prepare_launcher_icons.py" "$ICON_SOURCE" "$TARGET_DIR/assets" "$REMOVE_BACKGROUND" "$PROCESS_BACKGROUND_COLOR" "$DYNAMIC_THEMED_ICON"
           cd "$TARGET_DIR"
           flutter pub add --dev flutter_launcher_icons:^0.14.4
-          cat >> pubspec.yaml <<'ICONCONFIG'
+          cat >> pubspec.yaml <<ICONCONFIG
           flutter_launcher_icons:
             android: true
             image_path: "assets/app_icon.png"
-            adaptive_icon_background: "#FFFFFF"
+            adaptive_icon_background: "$ADAPTIVE_BACKGROUND_COLOR"
             adaptive_icon_foreground: "assets/app_icon_foreground.png"
-            adaptive_icon_monochrome: "assets/app_icon_monochrome.png"
           ICONCONFIG
+          if [[ "${DYNAMIC_THEMED_ICON,,}" == "true" ]]; then
+            printf '  adaptive_icon_monochrome: "assets/app_icon_monochrome.png"\n' >> pubspec.yaml
+            echo 'Dynamic themed icon enabled: Android 13+ monochrome layer will be generated.'
+          else
+            echo 'Dynamic themed icon disabled by project settings.'
+          fi
           dart run flutter_launcher_icons
-          echo 'Applied color, adaptive, round, and Android 13+ monochrome themed launcher icons.'
+          echo 'Applied color, round, and adaptive launcher icons using the selected background options.'
 
       - name: Build generated release APK
         if: ${{ github.event_name == 'repository_dispatch' }}
