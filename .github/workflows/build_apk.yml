@@ -1,33 +1,12 @@
-name: Build Simple App Builder and Generated APK
+name: Build Simple App Builder or a Flutter project
 
-# The builder app itself is generated from the embedded Dart source below.
-# Each run also compiles a user-created multi-file Dart project into a separate release APK.
+# The manual GitHub Actions run installs/builds only the builder APK.
+# A project created inside the app triggers repository_dispatch with a per-build payload.
+run-name: ${{ github.event.client_payload.request_id || 'Build Simple App Builder' }}
 on:
   workflow_dispatch:
-    inputs:
-      project_name:
-        description: 'Human-readable Android app name (1–60 characters)'
-        required: true
-        type: string
-      package_name:
-        description: 'Android application ID, e.g. com.example.myapp'
-        required: true
-        type: string
-      dart_code:
-        description: 'Optional legacy single-file lib/main.dart source; use source_archive_base64 for folders and multiple files'
-        required: false
-        default: ''
-        type: string
-      source_archive_base64:
-        description: 'Compressed ZIP (base64) containing lib/main.dart and other lib/**/*.dart files; normally supplied by the mobile builder'
-        required: false
-        default: ''
-        type: string
-      dependencies:
-        description: 'Optional comma-separated pub.dev package names, e.g. http,provider'
-        required: false
-        default: ''
-        type: string
+  repository_dispatch:
+    types: [build_flutter_app]
 
 permissions:
   contents: read
@@ -43,14 +22,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v7
 
-      - name: Validate workflow inputs
+      - name: Validate generated-app request
+        if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ inputs.project_name }}
-          PACKAGE_NAME: ${{ inputs.package_name }}
-          DART_CODE: ${{ inputs.dart_code }}
-          SOURCE_ARCHIVE_B64: ${{ inputs.source_archive_base64 }}
-          DEPENDENCIES: ${{ inputs.dependencies }}
+          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
+          DART_CODE: ${{ github.event.client_payload.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
+          DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -64,28 +44,28 @@ jobs:
               sys.exit('project_name must be 1–60 characters and contain no control characters.')
           if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}', package):
               sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
-          # Empty source means this run is only provisioning the Simple App Builder APK.
-          # The mobile app dispatches a second run with a Dart source archive after the
-          # user creates a project, chooses its icon, and supplies code in the app.
+          # This validator runs only for app-created repository_dispatch events.
+          # Manual workflow_dispatch builds the builder APK and has no project inputs.
+          if not bundle and not source.strip():
+              sys.exit('The mobile builder must send source_archive_base64 or dart_code for an app build.')
           if bundle and source.strip():
               sys.exit('Provide either source_archive_base64 or dart_code, not both.')
           if bundle and (len(bundle) > 55000 or not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle)):
               sys.exit('source_archive_base64 is invalid or too large. Repack a smaller project; the compressed payload must be at most 55,000 characters.')
           if len(source.encode('utf-8')) > 50000:
               sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
-          if not bundle and not source.strip():
-              print('No app source supplied: this is a builder-only installation run; generated-app build steps will be skipped.')
           for dep in re.split(r'[,;\s]+', deps.strip()):
               if dep and not re.fullmatch(r'[a-z][a-z0-9_]*', dep):
                   sys.exit(f'Invalid dependency package name: {dep!r}. Use comma-separated pub.dev package names only.')
-          print('Workflow inputs passed validation.')
+          print('Generated-app request payload passed validation.')
           PY
 
       - name: Prepare artifact name
         id: metadata
+        if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ inputs.project_name }}
+          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
         run: |
           set -euo pipefail
           slug="$(printf '%s' "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40)"
@@ -150,6 +130,7 @@ jobs:
           PY
 
       - name: Generate the real Simple App Builder application
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -547,31 +528,36 @@ jobs:
             }
 
             Future<void> dispatchBuild({
-              required String branch,
               required String projectName,
               required String packageName,
               required String sourceArchiveBase64,
               required String dependencies,
+              required bool hasCustomIcon,
+              required String requestId,
             }) async {
-              final response = await request('POST', '$_repoPath/actions/workflows/$workflowFile/dispatches', body: {
-                'ref': branch,
-                'inputs': {
+              // repository_dispatch keeps project fields out of GitHub's static
+              // "Run workflow" form. The mobile app sends a different payload per build.
+              final response = await request('POST', '$_repoPath/dispatches', body: {
+                'event_type': 'build_flutter_app',
+                'client_payload': {
                   'project_name': projectName,
                   'package_name': packageName,
                   'source_archive_base64': sourceArchiveBase64,
                   'dependencies': dependencies,
+                  'has_custom_icon': hasCustomIcon,
+                  'request_id': requestId,
                 },
               });
               if (response.statusCode != 204 && response.statusCode != 201) {
                 checkedJson(response);
-                throw Exception('GitHub did not accept the workflow dispatch.');
+                throw Exception('GitHub did not accept the app-build request.');
               }
             }
 
             Future<int> latestWorkflowRunNumber() async {
               final result = checkedJson(await request(
                 'GET',
-                '$_repoPath/actions/workflows/$workflowFile/runs?event=workflow_dispatch&per_page=1',
+                '$_repoPath/actions/workflows/$workflowFile/runs?event=repository_dispatch&per_page=1',
               ));
               final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
                   .whereType<Map<String, dynamic>>()
@@ -582,17 +568,20 @@ jobs:
 
             Future<Map<String, dynamic>> waitForBuild(
               int previousRunNumber,
+              String requestId,
               void Function(String message) onStatus,
             ) async {
               for (var attempt = 0; attempt < 360; attempt++) {
                 await Future<void>.delayed(const Duration(seconds: 5));
                 final result = checkedJson(await request(
                   'GET',
-                  '$_repoPath/actions/workflows/$workflowFile/runs?event=workflow_dispatch&per_page=20',
+                  '$_repoPath/actions/workflows/$workflowFile/runs?event=repository_dispatch&per_page=50',
                 ));
                 final runs = (result['workflow_runs'] as List<dynamic>? ?? const [])
                     .whereType<Map<String, dynamic>>()
-                    .where((run) => ((run['run_number'] as int?) ?? 0) > previousRunNumber)
+                    .where((run) =>
+                        ((run['run_number'] as int?) ?? 0) > previousRunNumber &&
+                        (run['display_title'] ?? '').toString() == requestId)
                     .toList()
                   ..sort((a, b) => (b['run_number'] as int? ?? 0).compareTo(a['run_number'] as int? ?? 0));
                 if (runs.isEmpty) {
@@ -1456,21 +1445,25 @@ jobs:
                 final archiveBytes = _createSourceArchive();
                 final sourceArchiveBase64 = base64Encode(archiveBytes);
                 if (sourceArchiveBase64.length > 55000) {
-                  throw Exception('The compressed Dart project is too large for a workflow_dispatch input (maximum 55,000 Base64 characters). Remove large/generated files and retry.');
+                  throw Exception('The compressed Dart project is too large for the GitHub event payload (maximum 55,000 Base64 characters). Remove large/generated files and retry.');
                 }
                 final api = widget.apiFactory();
                 _setStatus('Checking repository and default branch…');
                 final branch = await api.defaultBranch();
+                final hasCustomIcon = _iconBytes != null;
+                final requestId = '${_name.text.trim()}-${DateTime.now().microsecondsSinceEpoch}';
                 final payloadSize = utf8.encode(jsonEncode({
-                  'ref': branch,
-                  'inputs': {
+                  'event_type': 'build_flutter_app',
+                  'client_payload': {
                     'project_name': _name.text.trim(),
                     'package_name': _packageName.text.trim(),
                     'source_archive_base64': sourceArchiveBase64,
                     'dependencies': _dependencies.text.trim(),
+                    'has_custom_icon': hasCustomIcon,
+                    'request_id': requestId,
                   },
                 })).length;
-                if (payloadSize > 60000) throw Exception('The workflow input payload is too large after JSON encoding. Reduce the project source or dependency list.');
+                if (payloadSize > 60000) throw Exception('The GitHub event payload is too large after JSON encoding. Reduce the project source or dependency list.');
                 if (_iconBytes != null) {
                   _setStatus('Uploading icon.png to the repository…');
                   await api.uploadRootIcon(branch, _iconBytes!);
@@ -1478,13 +1471,14 @@ jobs:
                 final previousRunNumber = await api.latestWorkflowRunNumber();
                 _setStatus('Triggering GitHub Actions with ${_allDartFiles().length} Dart files…');
                 await api.dispatchBuild(
-                  branch: branch,
                   projectName: _name.text.trim(),
                   packageName: _packageName.text.trim(),
                   sourceArchiveBase64: sourceArchiveBase64,
                   dependencies: _dependencies.text.trim(),
+                  hasCustomIcon: hasCustomIcon,
+                  requestId: requestId,
                 );
-                final run = await api.waitForBuild(previousRunNumber, _setStatus);
+                final run = await api.waitForBuild(previousRunNumber, requestId, _setStatus);
                 _setStatus('Build passed. Downloading APK artifact…');
                 final zip = await api.downloadGeneratedApk((run['id'] ?? '').toString());
                 final archive = ZipDecoder().decodeBytes(zip);
@@ -1634,7 +1628,7 @@ jobs:
                     content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
                       Text('Target repository: ${widget.repository.isEmpty ? '(not configured)' : widget.repository}'),
                       const SizedBox(height: 8),
-                      Text('The workflow creates a fresh Flutter project and restores ${_additionalFiles.length + 1} Dart source files with their folder structure. It resolves dependencies detected in imports plus the packages listed above, applies the app icon, and builds a release APK. The builder APK is uploaded separately.'),
+                      Text('The workflow creates a fresh Flutter project and restores ${_additionalFiles.length + 1} Dart source files with their folder structure. It resolves dependencies detected in imports plus the packages listed above, applies the app icon, and builds a release APK. The builder APK is built during manual workflow runs; this request produces the separate APK for your project.'),
                       if (_status.isNotEmpty) ...[
                         const SizedBox(height: 16),
                         if (_building) const LinearProgressIndicator(),
@@ -1701,6 +1695,7 @@ jobs:
       # Upload the builder first so it remains available even when a user's app has a
       # Dart compile error later in the same run.
       - name: Upload Simple App Builder APK
+        if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: actions/upload-artifact@v4
         with:
           name: simple-app-builder-${{ github.run_number }}
@@ -1711,14 +1706,14 @@ jobs:
 
       # Build the target project from the multi-file source archive after the builder artifact is safe.
       - name: Create the requested Flutter project and restore its Dart file tree
-        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
+        if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         env:
-          PROJECT_NAME: ${{ inputs.project_name }}
-          PACKAGE_NAME: ${{ inputs.package_name }}
-          DART_CODE: ${{ inputs.dart_code }}
-          SOURCE_ARCHIVE_B64: ${{ inputs.source_archive_base64 }}
-          DEPENDENCIES: ${{ inputs.dependencies }}
+          PROJECT_NAME: ${{ github.event.client_payload.project_name }}
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
+          DART_CODE: ${{ github.event.client_payload.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ github.event.client_payload.source_archive_base64 }}
+          DEPENDENCIES: ${{ github.event.client_payload.dependencies }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
@@ -1817,7 +1812,7 @@ jobs:
           flutter pub get
 
       - name: Apply root icon.png as Android launcher icons
-        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.has_custom_icon == true }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1848,7 +1843,7 @@ jobs:
           fi
 
       - name: Build generated release APK
-        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
+        if: ${{ github.event_name == 'repository_dispatch' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1858,7 +1853,7 @@ jobs:
           cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/${{ steps.metadata.outputs.slug }}-release.apk"
 
       - name: Upload generated release APK
-        if: ${{ inputs.source_archive_base64 != '' || inputs.dart_code != '' }}
+        if: ${{ github.event_name == 'repository_dispatch' }}
         uses: actions/upload-artifact@v4
         with:
           name: generated-apk-${{ steps.metadata.outputs.slug }}
