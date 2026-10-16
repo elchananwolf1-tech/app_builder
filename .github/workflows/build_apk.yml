@@ -1,7 +1,7 @@
 name: Build Simple App Builder and Generated APK
 
 # The builder app itself is generated from the embedded Dart source below.
-# Each run also compiles the user-supplied dart_code into a separate release APK.
+# Each run also compiles a user-created multi-file Dart project into a separate release APK.
 on:
   workflow_dispatch:
     inputs:
@@ -14,8 +14,19 @@ on:
         required: true
         type: string
       dart_code:
-        description: 'Complete contents of lib/main.dart for the app to generate'
-        required: true
+        description: 'Optional legacy single-file lib/main.dart source; use source_archive_base64 for folders and multiple files'
+        required: false
+        default: ''
+        type: string
+      source_archive_base64:
+        description: 'Compressed ZIP (base64) containing lib/main.dart and other lib/**/*.dart files; normally supplied by the mobile builder'
+        required: false
+        default: ''
+        type: string
+      dependencies:
+        description: 'Optional comma-separated pub.dev package names, e.g. http,provider'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -38,6 +49,8 @@ jobs:
           PROJECT_NAME: ${{ inputs.project_name }}
           PACKAGE_NAME: ${{ inputs.package_name }}
           DART_CODE: ${{ inputs.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ inputs.source_archive_base64 }}
+          DEPENDENCIES: ${{ inputs.dependencies }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -45,15 +58,22 @@ jobs:
           name = os.environ.get('PROJECT_NAME', '').strip()
           package = os.environ.get('PACKAGE_NAME', '').strip()
           source = os.environ.get('DART_CODE', '')
+          bundle = os.environ.get('SOURCE_ARCHIVE_B64', '').strip()
+          deps = os.environ.get('DEPENDENCIES', '')
           if not name or len(name) > 60 or any(ord(c) < 32 for c in name):
               sys.exit('project_name must be 1–60 characters and contain no control characters.')
           if not re.fullmatch(r'[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}', package):
               sys.exit('package_name must be lowercase reverse-DNS format with at least three segments, e.g. com.example.myapp.')
-          if not source.strip():
-              sys.exit('dart_code must contain a complete Flutter main.dart file.')
+          if not bundle and not source.strip():
+              sys.exit('Provide source_archive_base64 (recommended multi-file project) or dart_code (legacy single-file mode).')
+          if bundle and (len(bundle) > 55000 or not re.fullmatch(r'[A-Za-z0-9+/=]+', bundle)):
+              sys.exit('source_archive_base64 is invalid or too large. Repack a smaller project; the compressed payload must be at most 55,000 characters.')
           if len(source.encode('utf-8')) > 50000:
-              sys.exit('dart_code exceeds 50 KB. Reduce it or split code into a project package before dispatching.')
-          print('Input validation passed.')
+              sys.exit('dart_code exceeds 50 KB. Use the mobile builder multi-file archive mode instead.')
+          for dep in re.split(r'[,;\s]+', deps.strip()):
+              if dep and not re.fullmatch(r'[a-z][a-z0-9_]*', dep):
+                  sys.exit(f'Invalid dependency package name: {dep!r}. Use comma-separated pub.dev package names only.')
+          print('Workflow inputs passed validation.')
           PY
 
       - name: Prepare artifact name
@@ -204,19 +224,28 @@ jobs:
               required this.name,
               required this.packageName,
               required this.dartCode,
+              this.additionalFiles = const {},
+              this.dependencies = '',
               this.iconBase64,
             });
 
             final String id;
             final String name;
             final String packageName;
+            // Keep dartCode as the main entry point for migration compatibility.
             final String dartCode;
+            // Keys are full relative paths, such as lib/screens/home_screen.dart.
+            final Map<String, String> additionalFiles;
+            // Explicit packages supplement packages discovered from Dart imports.
+            final String dependencies;
             final String? iconBase64;
 
             AppProject copyWith({
               String? name,
               String? packageName,
               String? dartCode,
+              Map<String, String>? additionalFiles,
+              String? dependencies,
               String? iconBase64,
               bool clearIcon = false,
             }) => AppProject(
@@ -224,6 +253,8 @@ jobs:
                   name: name ?? this.name,
                   packageName: packageName ?? this.packageName,
                   dartCode: dartCode ?? this.dartCode,
+                  additionalFiles: additionalFiles ?? this.additionalFiles,
+                  dependencies: dependencies ?? this.dependencies,
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
                 );
 
@@ -232,16 +263,150 @@ jobs:
                   'name': name,
                   'packageName': packageName,
                   'dartCode': dartCode,
+                  'additionalFiles': additionalFiles,
+                  'dependencies': dependencies,
                   'iconBase64': iconBase64,
                 };
 
-            factory AppProject.fromJson(Map<String, dynamic> json) => AppProject(
-                  id: (json['id'] ?? DateTime.now().microsecondsSinceEpoch).toString(),
-                  name: (json['name'] ?? 'Untitled app').toString(),
-                  packageName: (json['packageName'] ?? 'com.example.myapp').toString(),
-                  dartCode: (json['dartCode'] ?? '').toString(),
-                  iconBase64: json['iconBase64']?.toString(),
-                );
+            factory AppProject.fromJson(Map<String, dynamic> json) {
+              final files = <String, String>{};
+              final rawFiles = json['additionalFiles'];
+              if (rawFiles is Map) {
+                for (final entry in rawFiles.entries) {
+                  files[entry.key.toString()] = entry.value.toString();
+                }
+              }
+              return AppProject(
+                id: (json['id'] ?? DateTime.now().microsecondsSinceEpoch).toString(),
+                name: (json['name'] ?? 'Untitled app').toString(),
+                packageName: (json['packageName'] ?? 'com.example.myapp').toString(),
+                dartCode: (json['dartCode'] ?? '').toString(),
+                additionalFiles: files,
+                dependencies: (json['dependencies'] ?? '').toString(),
+                iconBase64: json['iconBase64']?.toString(),
+              );
+            }
+          }
+
+          // Templates are starting points, not fixed generated apps. Users can change
+          // every source file and add any number of folders/files below lib/ before building.
+          Map<String, String> _templateFiles(String template) {
+            switch (template) {
+              case 'Blank screen':
+                return {
+                  'lib/main.dart': '''import 'package:flutter/material.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+          const MyApp({super.key});
+
+          @override
+          Widget build(BuildContext context) => MaterialApp(
+          title: 'My App',
+          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.dark),
+          themeMode: ThemeMode.system,
+          home: const Scaffold(body: SizedBox.shrink()),
+          );
+          }
+          ''',
+                };
+              case 'Counter example':
+                return {
+                  'lib/main.dart': '''import 'package:flutter/material.dart';
+
+          void main() => runApp(const CounterApp());
+
+          class CounterApp extends StatelessWidget {
+          const CounterApp({super.key});
+          @override
+          Widget build(BuildContext context) => MaterialApp(
+          title: 'Counter',
+          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
+          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal, brightness: Brightness.dark),
+          themeMode: ThemeMode.system,
+          home: const CounterScreen(),
+          );
+          }
+
+          class CounterScreen extends StatefulWidget {
+          const CounterScreen({super.key});
+          @override
+          State<CounterScreen> createState() => _CounterScreenState();
+          }
+
+          class _CounterScreenState extends State<CounterScreen> {
+          int count = 0;
+          @override
+          Widget build(BuildContext context) => Scaffold(
+          appBar: AppBar(title: const Text('Counter')),
+          body: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const Text('You have pressed the button this many times:'),
+          Text('\$count', style: Theme.of(context).textTheme.displayMedium),
+          ])),
+          floatingActionButton: FloatingActionButton(
+          onPressed: () => setState(() => count++),
+          child: const Icon(Icons.add),
+          ),
+          );
+          }
+          ''',
+                };
+              default: // Material 3 starter uses a real multi-file lib/ structure.
+                return {
+                  'lib/main.dart': '''import 'package:flutter/material.dart';
+          import 'screens/home_screen.dart';
+
+          void main() => runApp(const MyApp());
+
+          class MyApp extends StatelessWidget {
+          const MyApp({super.key});
+
+          @override
+          Widget build(BuildContext context) => MaterialApp(
+          title: 'My App',
+          theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+          darkTheme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo, brightness: Brightness.dark),
+          themeMode: ThemeMode.system,
+          home: const HomeScreen(),
+          );
+          }
+          ''',
+                  'lib/screens/home_screen.dart': '''import 'package:flutter/material.dart';
+
+          class HomeScreen extends StatelessWidget {
+          const HomeScreen({super.key});
+
+          @override
+          Widget build(BuildContext context) => Scaffold(
+          appBar: AppBar(title: const Text('My App')),
+          body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text('Your project is ready. Edit this screen or add new Dart files in the project file tree.'),
+          ),
+          ),
+          );
+          }
+          ''',
+                };
+            }
+          }
+
+          bool _isSafeDartPath(String path) {
+            if (!path.startsWith('lib/') || !path.endsWith('.dart') || path.contains('\\')) return false;
+            if (!RegExp(r'^lib/[A-Za-z0-9_./-]+\.dart$').hasMatch(path)) return false;
+            final segments = path.split('/');
+            return !segments.any((part) => part.isEmpty || part == '.' || part == '..');
+          }
+
+          String _widgetClassNameForPath(String path) {
+            final stem = path.split('/').last.replaceFirst(RegExp(r'\.dart$'), '');
+            final parts = stem.split(RegExp(r'[^A-Za-z0-9]+')).where((part) => part.isNotEmpty);
+            var result = parts.map((part) => part[0].toUpperCase() + part.substring(1)).join();
+            if (result.isEmpty || RegExp(r'^[0-9]').hasMatch(result)) result = 'Generated$result';
+            return result;
           }
 
           class GitHubApi {
@@ -380,14 +545,16 @@ jobs:
               required String branch,
               required String projectName,
               required String packageName,
-              required String dartCode,
+              required String sourceArchiveBase64,
+              required String dependencies,
             }) async {
               final response = await request('POST', '$_repoPath/actions/workflows/$workflowFile/dispatches', body: {
                 'ref': branch,
                 'inputs': {
                   'project_name': projectName,
                   'package_name': packageName,
-                  'dart_code': dartCode,
+                  'source_archive_base64': sourceArchiveBase64,
+                  'dependencies': dependencies,
                 },
               });
               if (response.statusCode != 204 && response.statusCode != 201) {
@@ -1032,13 +1199,17 @@ jobs:
           class _ProjectWizardState extends State<ProjectWizard> {
             late final TextEditingController _name;
             late final TextEditingController _packageName;
+            late final TextEditingController _dependencies;
             late final String _projectId;
             late String _dartCode;
+            late Map<String, String> _additionalFiles;
+            String _selectedTemplate = 'Material 3 starter';
             Uint8List? _iconBytes;
             int _step = 0;
             bool _building = false;
             String _status = '';
-            bool _saved = false;
+
+            List<String> get _sortedAdditionalPaths => _additionalFiles.keys.toList()..sort();
 
             @override
             void initState() {
@@ -1046,39 +1217,92 @@ jobs:
               _projectId = widget.existing?.id ?? DateTime.now().microsecondsSinceEpoch.toString();
               _name = TextEditingController(text: widget.existing?.name ?? 'My Flutter App');
               _packageName = TextEditingController(text: widget.existing?.packageName ?? 'com.example.myapp');
-              _dartCode = widget.existing?.dartCode ?? '';
+              _dependencies = TextEditingController(text: widget.existing?.dependencies ?? '');
+              if (widget.existing == null) {
+                final starter = _templateFiles(_selectedTemplate);
+                _dartCode = starter['lib/main.dart']!;
+                _additionalFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
+              } else {
+                _dartCode = widget.existing!.dartCode;
+                _additionalFiles = Map<String, String>.from(widget.existing!.additionalFiles);
+                _selectedTemplate = 'Custom project';
+              }
               if (widget.existing?.iconBase64 != null) {
                 try { _iconBytes = base64Decode(widget.existing!.iconBase64!); } catch (_) {}
               }
-              if (widget.existing != null) _step = 0;
             }
 
-
-
             @override
-            void dispose() { _name.dispose(); _packageName.dispose(); super.dispose(); }
+            void dispose() {
+              _name.dispose();
+              _packageName.dispose();
+              _dependencies.dispose();
+              super.dispose();
+            }
 
             AppProject _project() => AppProject(
               id: _projectId,
               name: _name.text.trim(),
               packageName: _packageName.text.trim(),
               dartCode: _dartCode,
+              additionalFiles: Map<String, String>.from(_additionalFiles),
+              dependencies: _dependencies.text.trim(),
               iconBase64: _iconBytes == null ? null : base64Encode(_iconBytes!),
             );
 
+            Map<String, String> _allDartFiles() => <String, String>{
+              'lib/main.dart': _dartCode,
+              ..._additionalFiles,
+            };
+
             bool _validDetails() {
-              if (_name.text.trim().isEmpty || _name.text.trim().length > 60) { _message('Project name must be 1–60 characters.'); return false; }
+              if (_name.text.trim().isEmpty || _name.text.trim().length > 60) {
+                _message('Project name must be 1–60 characters.');
+                return false;
+              }
               if (!RegExp(r'^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*){2,}$').hasMatch(_packageName.text.trim())) {
-                _message('Package name must be lowercase reverse-DNS format, e.g. com.example.myapp.'); return false;
+                _message('Package name must be lowercase reverse-DNS format, e.g. com.example.myapp.');
+                return false;
               }
               return true;
             }
 
-            void _message(String message) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message))); }
+            bool _validateFileTree() {
+              final files = _allDartFiles();
+              if (_dartCode.trim().isEmpty) {
+                _message('lib/main.dart is empty. Add your app entry point before building.');
+                return false;
+              }
+              if (files.length > 200) {
+                _message('A project may contain up to 200 Dart source files in this builder.');
+                return false;
+              }
+              var sourceBytes = 0;
+              for (final entry in files.entries) {
+                if (!_isSafeDartPath(entry.key)) {
+                  _message('Invalid source path: ${entry.key}. Use safe paths under lib/ ending in .dart.');
+                  return false;
+                }
+                sourceBytes += utf8.encode(entry.value).length;
+              }
+              if (sourceBytes > 2 * 1024 * 1024) {
+                _message('Dart source is larger than 2 MB. Remove generated or unnecessary source files.');
+                return false;
+              }
+              for (final dep in _dependencies.text.split(RegExp(r'[,;\s]+')).where((item) => item.isNotEmpty)) {
+                if (!RegExp(r'^[a-z][a-z0-9_]*$').hasMatch(dep)) {
+                  _message('Invalid pub.dev package name "$dep". Use names separated by commas, e.g. http,provider.');
+                  return false;
+                }
+              }
+              return true;
+            }
+
+            void _message(String message) {
+              if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+            }
 
             Future<void> _pickIcon() async {
-              // file_picker 12 returns one PlatformFile from pickFile(); read bytes via
-              // PlatformFile.readAsBytes() so this works with Android document-provider URIs.
               final picked = await FilePicker.pickFile(type: FileType.image);
               if (picked == null) return;
               final bytes = await picked.readAsBytes();
@@ -1087,26 +1311,126 @@ jobs:
               setState(() => _iconBytes = bytes);
             }
 
-            Future<void> _pickDartFile() async {
+            Future<void> _importMainDart() async {
               final picked = await FilePicker.pickFile(type: FileType.custom, allowedExtensions: const ['dart']);
               if (picked == null) return;
               final bytes = await picked.readAsBytes();
               if (bytes.isEmpty) { _message('Could not read that file.'); return; }
-              setState(() => _dartCode = utf8.decode(bytes, allowMalformed: true));
+              setState(() {
+                _dartCode = utf8.decode(bytes, allowMalformed: true);
+                _selectedTemplate = 'Custom project';
+              });
             }
 
-            Future<void> _editCode() async {
-              final edited = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => CodeEditorScreen(title: 'Edit main.dart', initialText: _dartCode, kind: 'dart')));
-              if (edited != null) setState(() => _dartCode = edited);
+            Future<void> _editFile(String path) async {
+              final initial = path == 'lib/main.dart' ? _dartCode : (_additionalFiles[path] ?? '');
+              final edited = await Navigator.of(context).push<String>(MaterialPageRoute(
+                builder: (_) => CodeEditorScreen(title: path, initialText: initial, kind: 'dart'),
+              ));
+              if (edited == null) return;
+              setState(() {
+                if (path == 'lib/main.dart') {
+                  _dartCode = edited;
+                } else {
+                  _additionalFiles[path] = edited;
+                }
+                _selectedTemplate = 'Custom project';
+              });
+            }
+
+            Future<void> _addDartFile() async {
+              final controller = TextEditingController(text: 'lib/screens/new_screen.dart');
+              final path = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Add Dart file'),
+                content: SizedBox(width: 440, child: TextField(
+                  controller: controller,
+                  autofocus: true,
+                  autocorrect: false,
+                  decoration: const InputDecoration(
+                    labelText: 'File path',
+                    hintText: 'lib/screens/home_screen.dart',
+                    helperText: 'Use a path under lib/, including folders and the .dart extension.',
+                  ),
+                )),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(context, controller.text.trim()), child: const Text('Create file')),
+                ],
+              ));
+              controller.dispose();
+              if (path == null) return;
+              if (!_isSafeDartPath(path) || path == 'lib/main.dart') {
+                _message('Use a path such as lib/screens/home_screen.dart. lib/main.dart is the required entry point.');
+                return;
+              }
+              if (_additionalFiles.containsKey(path)) {
+                _message('That file already exists. Open it from the file list instead.');
+                return;
+              }
+              final className = _widgetClassNameForPath(path);
+              setState(() {
+                _additionalFiles[path] = '''import 'package:flutter/material.dart';
+
+          class $className extends StatelessWidget {
+          const $className({super.key});
+
+          @override
+          Widget build(BuildContext context) => const SizedBox.shrink();
+          }
+          ''';
+                _selectedTemplate = 'Custom project';
+              });
+              await _editFile(path);
+            }
+
+            Future<void> _removeFile(String path) async {
+              if (path == 'lib/main.dart') return;
+              final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Delete Dart file?'),
+                content: Text('Delete $path from this project?'),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Delete')),
+                ],
+              ));
+              if (confirmed == true) setState(() => _additionalFiles.remove(path));
+            }
+
+            Future<void> _applyTemplate() async {
+              if (_selectedTemplate == 'Custom project') {
+                _message('Choose a starter template first.');
+                return;
+              }
+              final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+                title: const Text('Replace project source?'),
+                content: const Text('Applying a template replaces lib/main.dart and removes the other Dart files from this project. This does not affect other saved projects.'),
+                actions: [
+                  TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                  FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Apply template')),
+                ],
+              ));
+              if (confirmed != true) return;
+              final starter = _templateFiles(_selectedTemplate);
+              setState(() {
+                _dartCode = starter['lib/main.dart']!;
+                _additionalFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
+              });
+            }
+
+            Uint8List _createSourceArchive() {
+              final sourceArchive = Archive();
+              for (final entry in _allDartFiles().entries) {
+                final bytes = Uint8List.fromList(utf8.encode(entry.value));
+                sourceArchive.addFile(ArchiveFile(entry.key, bytes.length, bytes));
+              }
+              final encoded = ZipEncoder().encode(sourceArchive);
+              return Uint8List.fromList(encoded);
             }
 
             Future<void> _continue() async {
               if (_building) return;
               if (_step == 0 && !_validDetails()) return;
-              if (_step == 2) {
-                if (_dartCode.trim().isEmpty) { _message('Choose a Dart file or enter Dart source code.'); return; }
-                if (utf8.encode(_dartCode).length > 50000) { _message('Dart source is too large for a workflow_dispatch input (maximum 50 KB).'); return; }
-              }
+              if (_step == 2 && !_validateFileTree()) return;
               if (_step < 3) {
                 setState(() => _step++);
                 return;
@@ -1115,29 +1439,46 @@ jobs:
             }
 
             Future<void> _buildAndDownload() async {
-              if (!_validDetails()) return;
+              if (!_validDetails() || !_validateFileTree()) return;
               if (widget.repository.isEmpty) { _message('Repository is not configured. Open Settings.'); return; }
-              if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(widget.repository)) { _message('Repository should be owner/repository.'); return; }
-              if (_dartCode.trim().isEmpty || utf8.encode(_dartCode).length > 50000) { _message('Enter valid Dart source smaller than 50 KB.'); return; }
-              setState(() { _building = true; _status = 'Saving project…'; });
+              if (!RegExp(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$').hasMatch(widget.repository)) {
+                _message('Repository should be owner/repository.');
+                return;
+              }
+              setState(() { _building = true; _status = 'Saving project and packing its Dart file tree…'; });
               try {
                 await widget.onSaveProject(_project());
-                _saved = true;
+                final archiveBytes = _createSourceArchive();
+                final sourceArchiveBase64 = base64Encode(archiveBytes);
+                if (sourceArchiveBase64.length > 55000) {
+                  throw Exception('The compressed Dart project is too large for a workflow_dispatch input (maximum 55,000 Base64 characters). Remove large/generated files and retry.');
+                }
                 final api = widget.apiFactory();
                 _setStatus('Checking repository and default branch…');
                 final branch = await api.defaultBranch();
                 final payloadSize = utf8.encode(jsonEncode({
                   'ref': branch,
-                  'inputs': {'project_name': _name.text.trim(), 'package_name': _packageName.text.trim(), 'dart_code': _dartCode},
+                  'inputs': {
+                    'project_name': _name.text.trim(),
+                    'package_name': _packageName.text.trim(),
+                    'source_archive_base64': sourceArchiveBase64,
+                    'dependencies': _dependencies.text.trim(),
+                  },
                 })).length;
-                if (payloadSize > 60000) throw Exception('The workflow input payload is too large after JSON encoding. Shorten the Dart source and retry.');
+                if (payloadSize > 60000) throw Exception('The workflow input payload is too large after JSON encoding. Reduce the project source or dependency list.');
                 if (_iconBytes != null) {
                   _setStatus('Uploading icon.png to the repository…');
                   await api.uploadRootIcon(branch, _iconBytes!);
                 }
                 final previousRunNumber = await api.latestWorkflowRunNumber();
-                _setStatus('Triggering GitHub Actions…');
-                await api.dispatchBuild(branch: branch, projectName: _name.text.trim(), packageName: _packageName.text.trim(), dartCode: _dartCode);
+                _setStatus('Triggering GitHub Actions with ${_allDartFiles().length} Dart files…');
+                await api.dispatchBuild(
+                  branch: branch,
+                  projectName: _name.text.trim(),
+                  packageName: _packageName.text.trim(),
+                  sourceArchiveBase64: sourceArchiveBase64,
+                  dependencies: _dependencies.text.trim(),
+                );
                 final run = await api.waitForBuild(previousRunNumber, _setStatus);
                 _setStatus('Build passed. Downloading APK artifact…');
                 final zip = await api.downloadGeneratedApk((run['id'] ?? '').toString());
@@ -1174,59 +1515,132 @@ jobs:
 
             void _setStatus(String message) { if (mounted) setState(() => _status = message); }
 
+            Widget _fileTile(String path, {required bool isMain}) => Card(
+              margin: const EdgeInsets.only(bottom: 6),
+              child: ListTile(
+                leading: Icon(isMain ? Icons.play_circle_outline : Icons.code, color: Theme.of(context).colorScheme.primary),
+                title: Text(path, maxLines: 1, overflow: TextOverflow.ellipsis),
+                subtitle: Text(isMain ? 'App entry point' : 'Folder: ${path.substring(0, path.lastIndexOf('/'))}'),
+                onTap: () => _editFile(path),
+                trailing: Row(mainAxisSize: MainAxisSize.min, children: [
+                  IconButton(tooltip: 'Edit $path', onPressed: () => _editFile(path), icon: const Icon(Icons.edit_outlined)),
+                  if (!isMain) IconButton(tooltip: 'Delete $path', onPressed: () => _removeFile(path), icon: const Icon(Icons.delete_outline)),
+                ]),
+              ),
+            );
+
             @override
             Widget build(BuildContext context) => Scaffold(
-                  appBar: AppBar(title: Text(widget.existing == null ? 'Create project' : 'Build ${widget.existing!.name}')),
-                  body: Stepper(
-                    type: StepperType.vertical,
-                    currentStep: _step,
-                    onStepTapped: _building ? null : (step) => setState(() => _step = step),
-                    onStepContinue: _continue,
-                    onStepCancel: _building ? null : () { if (_step > 0) setState(() => _step--); else Navigator.pop(context); },
-                    controlsBuilder: (context, details) => Padding(
-                      padding: const EdgeInsets.only(top: 16),
-                      child: Row(children: [
-                        FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build and download APK') : 'Continue')),
-                        const SizedBox(width: 10),
-                        if (!_building) TextButton(onPressed: details.onStepCancel, child: Text(_step == 0 ? 'Cancel' : 'Back')),
-                      ]),
-                    ),
-                    steps: [
-                      Step(title: const Text('Project details'), subtitle: const Text('Name and Android package ID'), isActive: _step >= 0, state: _step > 0 ? StepState.complete : StepState.indexed, content: Column(children: [
-                        TextField(controller: _name, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'My Company App')),
-                        const SizedBox(height: 12),
-                        TextField(controller: _packageName, autocorrect: false, decoration: const InputDecoration(labelText: 'Package name', hintText: 'com.company.myapp', helperText: 'Use lowercase reverse-DNS format with at least three segments.')),
-                      ])),
-                      Step(title: const Text('App logo'), subtitle: const Text('Optional icon.png'), isActive: _step >= 1, state: _step > 1 ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        const Text('Select a square PNG or other supported image. It will be uploaded as the repository root icon.png and generated into Android launcher icon sizes.'),
-                        const SizedBox(height: 14),
-                        if (_iconBytes != null) Center(child: ClipRRect(borderRadius: BorderRadius.circular(18), child: Image.memory(_iconBytes!, width: 112, height: 112, fit: BoxFit.cover))) else const Center(child: Icon(Icons.image_outlined, size: 80)),
-                        const SizedBox(height: 10),
-                        Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() => _iconBytes = null), icon: const Icon(Icons.delete_outline))]),
-                      ])),
-                      Step(title: const Text('Dart source'), subtitle: const Text('Import a .dart file or edit code'), isActive: _step >= 2, state: _step > 2 ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text('${_dartCode.split('\n').length} lines · ${utf8.encode(_dartCode).length} bytes'),
-                        const SizedBox(height: 10),
-                        OutlinedButton.icon(onPressed: _pickDartFile, icon: const Icon(Icons.file_open), label: const Text('Choose .dart file (renamed to main.dart)')),
-                        const SizedBox(height: 8),
-                        FilledButton.tonalIcon(onPressed: _editCode, icon: const Icon(Icons.code), label: const Text('Open syntax-highlighting editor')),
-                        const SizedBox(height: 10),
-                        Container(width: double.infinity, constraints: const BoxConstraints(maxHeight: 180), padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(12)), child: SingleChildScrollView(child: SelectableText(_dartCode, maxLines: 14, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)))),
-                      ])),
-                      Step(title: const Text('Build and download'), subtitle: const Text('GitHub Actions release build'), isActive: _step >= 3, state: _status.startsWith('Build succeeded') ? StepState.complete : StepState.indexed, content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                        Text('Target repository: ${widget.repository.isEmpty ? '(not configured)' : widget.repository}'),
-                        const SizedBox(height: 8),
-                        const Text('The workflow creates a fresh Flutter project, installs dependencies referenced by package: imports, applies the launcher icon, and runs flutter build apk --release. The builder APK is uploaded as a separate artifact too.'),
-                        if (_status.isNotEmpty) ...[
-                          const SizedBox(height: 16),
-                          if (_building) const LinearProgressIndicator(),
-                          const SizedBox(height: 8),
-                          SelectableText(_status),
-                        ],
-                      ])),
-                    ],
+              appBar: AppBar(title: Text(widget.existing == null ? 'Create project' : 'Manage ${widget.existing!.name}')),
+              body: Stepper(
+                type: StepperType.vertical,
+                currentStep: _step,
+                onStepTapped: _building ? null : (step) => setState(() => _step = step),
+                onStepContinue: _continue,
+                onStepCancel: _building ? null : () { if (_step > 0) setState(() => _step--); else Navigator.pop(context); },
+                controlsBuilder: (context, details) => Padding(
+                  padding: const EdgeInsets.only(top: 16),
+                  child: Row(children: [
+                    FilledButton(onPressed: _building ? null : details.onStepContinue, child: Text(_step == 3 ? (_building ? 'Building…' : 'Build and download APK') : 'Continue')),
+                    const SizedBox(width: 10),
+                    if (!_building) TextButton(onPressed: details.onStepCancel, child: Text(_step == 0 ? 'Cancel' : 'Back')),
+                  ]),
+                ),
+                steps: [
+                  Step(
+                    title: const Text('Project details'),
+                    subtitle: const Text('Name and Android package ID'),
+                    isActive: _step >= 0,
+                    state: _step > 0 ? StepState.complete : StepState.indexed,
+                    content: Column(children: [
+                      TextField(controller: _name, maxLength: 60, decoration: const InputDecoration(labelText: 'Project name', hintText: 'My Company App')),
+                      const SizedBox(height: 12),
+                      TextField(controller: _packageName, autocorrect: false, decoration: const InputDecoration(labelText: 'Package name', hintText: 'com.company.myapp', helperText: 'Use lowercase reverse-DNS format with at least three segments.')),
+                    ]),
                   ),
-                );
+                  Step(
+                    title: const Text('App logo'),
+                    subtitle: const Text('Optional launcher icon'),
+                    isActive: _step >= 1,
+                    state: _step > 1 ? StepState.complete : StepState.indexed,
+                    content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('Select a square PNG or another supported image. The workflow generates Android launcher-icon sizes from the uploaded image.'),
+                      const SizedBox(height: 14),
+                      if (_iconBytes != null) Center(child: ClipRRect(borderRadius: BorderRadius.circular(18), child: Image.memory(_iconBytes!, width: 112, height: 112, fit: BoxFit.cover))) else const Center(child: Icon(Icons.image_outlined, size: 80)),
+                      const SizedBox(height: 10),
+                      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: _pickIcon, icon: const Icon(Icons.upload_file), label: const Text('Choose image'))), if (_iconBytes != null) IconButton(tooltip: 'Remove selected logo', onPressed: () => setState(() => _iconBytes = null), icon: const Icon(Icons.delete_outline))]),
+                    ]),
+                  ),
+                  Step(
+                    title: const Text('Dart project files'),
+                    subtitle: const Text('Choose a starter template, edit code, and build your own file tree'),
+                    isActive: _step >= 2,
+                    state: _step > 2 ? StepState.complete : StepState.indexed,
+                    content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      const Text('This is a real multi-file Flutter project. Start from a template, then add folders and Dart files under lib/, edit each file, and list additional pub.dev packages if needed. Package imports are also detected automatically during the build.'),
+                      const SizedBox(height: 12),
+                      DropdownButtonFormField<String>(
+                        value: _selectedTemplate,
+                        decoration: const InputDecoration(labelText: 'Starting template'),
+                        items: const [
+                          DropdownMenuItem(value: 'Material 3 starter', child: Text('Material 3 starter (two files)')),
+                          DropdownMenuItem(value: 'Counter example', child: Text('Counter example')),
+                          DropdownMenuItem(value: 'Blank screen', child: Text('Blank screen')),
+                          DropdownMenuItem(value: 'Custom project', child: Text('Custom project (keep my files)')),
+                        ],
+                        onChanged: (value) { if (value != null) setState(() => _selectedTemplate = value); },
+                      ),
+                      const SizedBox(height: 8),
+                      Align(alignment: Alignment.centerLeft, child: FilledButton.tonalIcon(
+                        onPressed: _building || _selectedTemplate == 'Custom project' ? null : _applyTemplate,
+                        icon: const Icon(Icons.auto_awesome),
+                        label: const Text('Apply selected template'),
+                      )),
+                      const SizedBox(height: 14),
+                      Row(children: [
+                        Expanded(child: Text('Project file tree · ${_additionalFiles.length + 1} files', style: Theme.of(context).textTheme.titleMedium)),
+                        FilledButton.icon(onPressed: _building ? null : _addDartFile, icon: const Icon(Icons.create_new_folder_outlined), label: const Text('Add Dart file')),
+                      ]),
+                      const SizedBox(height: 8),
+                      _fileTile('lib/main.dart', isMain: true),
+                      ..._sortedAdditionalPaths.map((path) => _fileTile(path, isMain: false)),
+                      const SizedBox(height: 4),
+                      OutlinedButton.icon(onPressed: _building ? null : _importMainDart, icon: const Icon(Icons.file_open), label: const Text('Import a .dart file into lib/main.dart')),
+                      const SizedBox(height: 14),
+                      TextField(
+                        controller: _dependencies,
+                        autocorrect: false,
+                        decoration: const InputDecoration(
+                          labelText: 'Additional pub.dev packages (optional)',
+                          hintText: 'http,provider,shared_preferences',
+                          helperText: 'Separate package names with commas. Packages referenced by package: imports are detected automatically.',
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      Text('Main entry point: ${_dartCode.split('\n').length} lines · ${utf8.encode(_dartCode).length} bytes', style: Theme.of(context).textTheme.bodySmall),
+                      Container(width: double.infinity, constraints: const BoxConstraints(maxHeight: 150), padding: const EdgeInsets.all(12), decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest, borderRadius: BorderRadius.circular(12)), child: SingleChildScrollView(child: SelectableText(_dartCode, maxLines: 12, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)))),
+                    ]),
+                  ),
+                  Step(
+                    title: const Text('Build and download'),
+                    subtitle: const Text('GitHub Actions release build'),
+                    isActive: _step >= 3,
+                    state: _status.startsWith('Build succeeded') ? StepState.complete : StepState.indexed,
+                    content: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Text('Target repository: ${widget.repository.isEmpty ? '(not configured)' : widget.repository}'),
+                      const SizedBox(height: 8),
+                      Text('The workflow creates a fresh Flutter project and restores ${_additionalFiles.length + 1} Dart source files with their folder structure. It resolves dependencies detected in imports plus the packages listed above, applies the app icon, and builds a release APK. The builder APK is uploaded separately.'),
+                      if (_status.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        if (_building) const LinearProgressIndicator(),
+                        const SizedBox(height: 8),
+                        SelectableText(_status),
+                      ],
+                    ]),
+                  ),
+                ],
+              ),
+            );
           }
 
           class CodeEditorScreen extends StatefulWidget {
@@ -1290,36 +1704,108 @@ jobs:
           retention-days: 14
           compression-level: 0
 
-      - name: Create the requested Flutter project and install source dependencies
+      # Build the target project from the multi-file source archive after the builder artifact is safe.
+      - name: Create the requested Flutter project and restore its Dart file tree
         shell: bash
         env:
           PROJECT_NAME: ${{ inputs.project_name }}
           PACKAGE_NAME: ${{ inputs.package_name }}
           DART_CODE: ${{ inputs.dart_code }}
+          SOURCE_ARCHIVE_B64: ${{ inputs.source_archive_base64 }}
+          DEPENDENCIES: ${{ inputs.dependencies }}
         run: |
           set -euo pipefail
           TARGET_DIR="$RUNNER_TEMP/generated_flutter_app"
           ORG="${PACKAGE_NAME%.*}"
           APP_SLUG="${PACKAGE_NAME##*.}"
           flutter create --org "$ORG" --project-name "$APP_SLUG" "$TARGET_DIR"
-          printf '%s' "$DART_CODE" > "$TARGET_DIR/lib/main.dart"
+
+          # An archive lets the mobile app send many separate Dart files/folders in one
+          # workflow input. Only safe .dart files under lib/ are restored; zip-slip and
+          # unexpectedly large archives are rejected before any file is written.
+          python3 - "$TARGET_DIR" <<'PYFILES'
+          import base64, io, os, re, shutil, sys, zipfile
+          from pathlib import Path, PurePosixPath
+
+          target = Path(sys.argv[1]).resolve()
+          bundle = os.environ.get('SOURCE_ARCHIVE_B64', '').strip()
+          legacy_source = os.environ.get('DART_CODE', '')
+          lib_dir = target / 'lib'
+          shutil.rmtree(lib_dir, ignore_errors=True)
+          lib_dir.mkdir(parents=True, exist_ok=True)
+
+          if bundle:
+              try:
+                  zipped = base64.b64decode(bundle, validate=True)
+                  if len(zipped) > 5 * 1024 * 1024:
+                      raise ValueError('compressed archive exceeds 5 MB')
+                  with zipfile.ZipFile(io.BytesIO(zipped)) as archive:
+                      entries = [info for info in archive.infolist() if not info.is_dir()]
+                      if not entries:
+                          raise ValueError('source archive is empty')
+                      if len(entries) > 200:
+                          raise ValueError('source archive contains more than 200 files')
+                      total_unpacked = 0
+                      for info in entries:
+                          rel = PurePosixPath(info.filename)
+                          if rel.is_absolute() or '..' in rel.parts or '\\' in info.filename:
+                              raise ValueError(f'unsafe file path: {info.filename!r}')
+                          if len(rel.parts) < 2 or rel.parts[0] != 'lib' or rel.suffix != '.dart':
+                              raise ValueError(f'only Dart files under lib/ are allowed: {info.filename!r}')
+                          if any(part in ('', '.') for part in rel.parts):
+                              raise ValueError(f'invalid file path: {info.filename!r}')
+                          if info.file_size > 1024 * 1024:
+                              raise ValueError(f'file is larger than 1 MB: {info.filename!r}')
+                          total_unpacked += info.file_size
+                          if total_unpacked > 2 * 1024 * 1024:
+                              raise ValueError('total Dart source exceeds 2 MB')
+                          destination = (target / Path(*rel.parts)).resolve()
+                          if lib_dir.resolve() not in destination.parents:
+                              raise ValueError(f'path escapes lib/: {info.filename!r}')
+                          destination.parent.mkdir(parents=True, exist_ok=True)
+                          destination.write_bytes(archive.read(info))
+              except (ValueError, zipfile.BadZipFile, OSError) as exc:
+                  raise SystemExit(f'Could not restore source_archive_base64: {exc}')
+          else:
+              if not legacy_source.strip():
+                  raise SystemExit('No source archive or legacy dart_code was provided.')
+              (lib_dir / 'main.dart').write_text(legacy_source, encoding='utf-8')
+
+          main_file = lib_dir / 'main.dart'
+          if not main_file.is_file() or not main_file.read_text(encoding='utf-8').strip():
+              raise SystemExit('Project source must contain a non-empty lib/main.dart entry point.')
+          print('Restored source tree:')
+          for source_file in sorted(lib_dir.rglob('*.dart')):
+              print(f'  {source_file.relative_to(target)}')
+          PYFILES
+
           python3 "$RUNNER_TEMP/patch_android_project.py" "$TARGET_DIR" "$PROJECT_NAME" "$PACKAGE_NAME"
 
-          # The workflow input contains main.dart rather than a second pubspec. Detect
-          # package: imports and add the corresponding pub.dev dependencies automatically.
-          python3 - "$TARGET_DIR/lib/main.dart" > "$RUNNER_TEMP/target_dependencies.txt" <<'PY'
-          import re, sys
-          source = open(sys.argv[1], encoding='utf-8').read()
-          packages = sorted(set(re.findall(r"package:([A-Za-z][A-Za-z0-9_]*)/", source)))
-          ignored = {'flutter', 'flutter_test', 'integration_test'}
-          for package in packages:
-              if package not in ignored and re.fullmatch(r'[a-z][a-z0-9_]*', package):
+          # Detect packages across every Dart source file, then merge with explicitly
+          # requested packages. This supports imports in lib/screens/, lib/widgets/, etc.
+          python3 - "$TARGET_DIR" > "$RUNNER_TEMP/target_dependencies.txt" <<'PYDEPS'
+          import os, re, sys
+          from pathlib import Path
+          target = Path(sys.argv[1])
+          packages = set()
+          for source_file in (target / 'lib').rglob('*.dart'):
+              source = source_file.read_text(encoding='utf-8')
+              packages.update(re.findall(r"package:([A-Za-z][A-Za-z0-9_]*)/", source))
+          for dep in re.split(r'[,;\s]+', os.environ.get('DEPENDENCIES', '').strip()):
+              if dep:
+                  if not re.fullmatch(r'[a-z][a-z0-9_]*', dep):
+                      raise SystemExit(f'Invalid dependency package name: {dep!r}')
+                  packages.add(dep)
+          own_package = os.environ.get('PACKAGE_NAME', '').split('.')[-1]
+          ignored = {'flutter', 'flutter_test', 'integration_test', own_package}
+          for package in sorted(packages - ignored):
+              if re.fullmatch(r'[a-z][a-z0-9_]*', package):
                   print(package)
-          PY
+          PYDEPS
           mapfile -t EXTRA_DEPENDENCIES < "$RUNNER_TEMP/target_dependencies.txt"
           cd "$TARGET_DIR"
           if ((${#EXTRA_DEPENDENCIES[@]})); then
-            echo "Installing detected Dart package dependencies: ${EXTRA_DEPENDENCIES[*]}"
+            echo "Installing detected/requested package dependencies: ${EXTRA_DEPENDENCIES[*]}"
             flutter pub add "${EXTRA_DEPENDENCIES[@]}"
           fi
           flutter pub get
