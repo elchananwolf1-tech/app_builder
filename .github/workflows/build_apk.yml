@@ -1,4 +1,4 @@
- name: Build Simple App Builder or a Flutter project
+name: Build Simple App Builder or a Flutter project
 
 # Manual runs build the Simple App Builder APK. App requests build an APK or AAB.
 # A project created inside the app triggers repository_dispatch with a per-build payload.
