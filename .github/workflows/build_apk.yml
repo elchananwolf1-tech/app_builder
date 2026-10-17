@@ -579,22 +579,65 @@ jobs:
           // Project source trees can be large; keep them out of SharedPreferences so Android
           // doesn't need to deserialize the entire project database with the small settings.
           Future<File> _projectsStorageFile() async {
-            final root = await getApplicationSupportDirectory();
-            final folder = Directory('${root.path}${Platform.pathSeparator}simple_app_builder');
-            await folder.create(recursive: true);
-            return File('${folder.path}${Platform.pathSeparator}projects_v1.json');
+            // App-private support storage is preferred. Documents is a safe fallback for
+            // devices/Android builds where the support-directory channel is unavailable.
+            // Neither path requires broad/shared-storage permissions.
+            Object? lastError;
+            final providers = <Future<Directory> Function()>[
+              getApplicationSupportDirectory,
+              getApplicationDocumentsDirectory,
+            ];
+            for (final provider in providers) {
+              try {
+                final root = await provider().timeout(const Duration(seconds: 6));
+                final folder = Directory('${root.path}${Platform.pathSeparator}simple_app_builder');
+                await folder.create(recursive: true).timeout(const Duration(seconds: 6));
+                return File('${folder.path}${Platform.pathSeparator}projects_v1.json');
+              } catch (error) {
+                lastError = error;
+                debugPrint('Project storage directory unavailable; trying fallback: $error');
+              }
+            }
+            throw FileSystemException(
+              'Could not access app-private project storage through support or documents directories. $lastError',
+            );
           }
 
           Future<void> _writeTextAtomically(File target, String value) async {
             final temp = File('${target.path}.tmp');
             await temp.writeAsString(value, flush: true);
             try {
+              // On Android/Linux this normally atomically replaces the destination.
               await temp.rename(target.path);
+              return;
             } on FileSystemException {
-              // Android normally replaces on rename. This fallback handles platforms that
-              // refuse replacing an existing file while keeping the completed temp file.
-              if (await target.exists()) await target.delete();
-              await temp.rename(target.path);
+              // Never delete the only saved-projects copy before the new file is in place.
+              if (!await target.exists()) {
+                await temp.copy(target.path);
+                await temp.delete();
+                return;
+              }
+              final backup = File('${target.path}.backup.${DateTime.now().microsecondsSinceEpoch}');
+              await target.rename(backup.path);
+              try {
+                await temp.rename(target.path);
+                // The new file is safely in place. If cleanup fails, keep the backup.
+                try {
+                  await backup.delete();
+                } catch (error) {
+                  debugPrint('Kept recoverable project-storage backup ${backup.path}: $error');
+                }
+              } catch (_) {
+                // Restore the previous file whenever replacement fails.
+                try {
+                  if (!await target.exists() && await backup.exists()) {
+                    await backup.rename(target.path);
+                  }
+                } catch (restoreError) {
+                  debugPrint('Could not restore the project-storage backup ${backup.path}: $restoreError');
+                }
+                rethrow;
+              }
             }
           }
 
@@ -2131,6 +2174,24 @@ jobs:
             }
           
             Future<void> _loadState() async {
+              try {
+                await _loadStateInternal();
+              } catch (error, stackTrace) {
+                // Last-resort startup guard: unexpected plugin/storage errors are logged but
+                // never force the user to restart or enter credentials before seeing setup.
+                debugPrint('Startup initialization failed; using a safe in-memory fallback: $error\n$stackTrace');
+                _startupWatchdog?.cancel();
+                _startupAttempt++;
+                if (!mounted) return;
+                setState(() {
+                  _startupError = null;
+                  _startupStatus = 'Ready with limited local storage';
+                  _ready = true;
+                });
+              }
+            }
+
+            Future<void> _loadStateInternal() async {
               final int attempt = ++_startupAttempt;
               _startupWatchdog?.cancel();
               if (mounted) {
@@ -2147,12 +2208,16 @@ jobs:
                 if (!mounted || attempt != _startupAttempt) return;
                 setState(() => _startupStatus = message);
                 _startupWatchdog?.cancel();
-                _startupWatchdog = Timer(const Duration(seconds: 30), () {
+                _startupWatchdog = Timer(const Duration(seconds: 20), () {
                   if (!mounted || attempt != _startupAttempt || _ready) return;
-                  _startupAttempt++; // Prevent a timed-out attempt overwriting its recovery screen.
+                  // A local-storage/plugin hang must not lock the user out before GitHub setup.
+                  // Invalidate this attempt so a late response cannot overwrite the fallback UI.
+                  _startupAttempt++;
+                  debugPrint('Startup stalled during "$message"; opening the app with in-memory state. '
+                      'No stored project or credential data was deleted.');
                   setState(() {
-                    _startupError = 'Startup stalled during: $message. Your saved data has not been deleted. '
-                        'Tap Retry startup. If it repeats, share this exact message.';
+                    _startupError = null;
+                    _startupStatus = 'Ready with limited local storage';
                     _ready = true;
                   });
                 });
@@ -5296,7 +5361,7 @@ jobs:
           fi
           flutter pub get
           python3 "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" "$BUILDER_DIR"
-          flutter build apk --release --no-pub --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
+          flutter build apk --release --no-pub --build-number "$GITHUB_RUN_NUMBER" --dart-define=BUILDER_REPOSITORY="$GITHUB_REPOSITORY"
           mkdir -p "$GITHUB_WORKSPACE/dist"
           cp build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/dist/simple-app-builder.apk"
 
