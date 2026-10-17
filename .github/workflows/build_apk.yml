@@ -567,7 +567,11 @@ jobs:
             defaultValue: '',
           );
           const String workflowFile = 'build_apk.yml';
-          const FlutterSecureStorage secureStorage = FlutterSecureStorage();
+          // Never let a transient Android Keystore/decryption problem prevent first launch.
+          // Keep existing secure data intact on read errors; the startup flow handles failures.
+          const FlutterSecureStorage secureStorage = FlutterSecureStorage(
+            aOptions: AndroidOptions(resetOnError: false),
+          );
 
           // Decode large persisted JSON outside the UI isolate to keep startup responsive.
           Object? _decodeJsonInBackground(String source) => jsonDecode(source);
@@ -2143,7 +2147,7 @@ jobs:
                 if (!mounted || attempt != _startupAttempt) return;
                 setState(() => _startupStatus = message);
                 _startupWatchdog?.cancel();
-                _startupWatchdog = Timer(const Duration(seconds: 20), () {
+                _startupWatchdog = Timer(const Duration(seconds: 30), () {
                   if (!mounted || attempt != _startupAttempt || _ready) return;
                   _startupAttempt++; // Prevent a timed-out attempt overwriting its recovery screen.
                   setState(() {
@@ -2159,11 +2163,11 @@ jobs:
               try {
                 results = await Future.wait<Object?>(<Future<Object?>>[
                   localPreferences.getString('repository')
-                      .timeout(const Duration(seconds: 8))
+                      .timeout(const Duration(seconds: 4))
                       .then<Object?>((value) => <String, Object?>{'ok': true, 'value': value})
                       .catchError((Object error) => <String, Object?>{'ok': false, 'error': error.toString()}),
                   secureStorage.read(key: 'github_accounts_v1')
-                      .timeout(const Duration(seconds: 8))
+                      .timeout(const Duration(seconds: 4))
                       .then<Object?>((value) => <String, Object?>{'ok': true, 'value': value})
                       .catchError((Object error) => <String, Object?>{'ok': false, 'error': error.toString()}),
                 ]).timeout(
@@ -2180,27 +2184,24 @@ jobs:
 
               final prefsResult = results.isNotEmpty && results[0] is Map<String, Object?>
                   ? results[0] as Map<String, Object?>
-                  : null;
+                  : <String, Object?>{'ok': false, 'error': 'Preferences read timed out'};
               final accountsResult = results.length > 1 && results[1] is Map<String, Object?>
                   ? results[1] as Map<String, Object?>
-                  : null;
-              if (prefsResult == null ||
-                  prefsResult['ok'] != true ||
-                  accountsResult == null ||
-                  accountsResult['ok'] != true) {
-                _startupWatchdog?.cancel();
-                if (mounted && attempt == _startupAttempt) {
-                  setState(() {
-                    _startupError = 'Could not open local app storage. Your saved projects have not been reset. '
-                        'Check device storage, then tap Retry startup.';
-                    _ready = true;
-                  });
-                }
-                return;
-              }
+                  : <String, Object?>{'ok': false, 'error': 'Secure storage read timed out'};
+              final bool preferencesAvailable = prefsResult['ok'] == true;
+              final bool secureAccountsAvailable = accountsResult['ok'] == true;
 
+              // Local state is optional on first launch. A missing/unavailable preference or
+              // secure-storage plugin must not block the app before GitHub setup is shown.
+              // We do not clear either store here; readable project-file data is still restored.
               final LocalPreferences prefs = localPreferences;
-              final rawAccounts = accountsResult['value'] as String?;
+              final rawAccounts = secureAccountsAvailable ? accountsResult['value'] as String? : null;
+              if (!preferencesAvailable) {
+                debugPrint('Startup: preferences unavailable; opening with safe defaults. ${prefsResult['error']}');
+              }
+              if (!secureAccountsAvailable) {
+                debugPrint('Startup: secure account storage unavailable; showing first-run setup. ${accountsResult['error']}');
+              }
               setStage('Reading saved account information…');
               try {
                 if (rawAccounts != null && rawAccounts.isNotEmpty) {
@@ -2221,47 +2222,44 @@ jobs:
                   _accounts = [];
                 }
               } catch (error) {
-                _startupWatchdog?.cancel();
-                if (mounted && attempt == _startupAttempt) {
-                  setState(() {
-                    _startupError = 'Could not read saved account data ($error). No local data was deleted. '
-                        'Tap Retry startup; if this repeats, share this message.';
-                    _ready = true;
-                  });
-                }
-                return;
+                // A missing/corrupt/unreadable saved-account record is treated as a first run.
+                // Do not clear secure storage; simply allow the user to connect GitHub again.
+                debugPrint('Startup: saved account record unavailable; showing setup. $error');
+                _accounts = <GitHubAccount>[];
               }
 
               setStage('Opening separate project storage…');
               String? rawProjects;
+              bool projectStorageReady = true;
+              bool projectDataRestored = true;
               try {
                 final projectsFile = await _projectsStorageFile().timeout(const Duration(seconds: 8));
                 final fileExists = await projectsFile.exists().timeout(const Duration(seconds: 5));
                 if (fileExists) {
                   rawProjects = await projectsFile.readAsString().timeout(const Duration(seconds: 15));
-                } else {
+                } else if (preferencesAvailable) {
                   // One-time migration from the previous version, which stored the complete
                   // source tree in SharedPreferences. Only remove the old value after the new
-                  // file has been written successfully.
+                  // file has been written successfully. If preferences are unavailable, start
+                  // with an empty in-memory list and leave all old storage untouched.
                   rawProjects = await prefs.getString('projects_v1')
-                      .timeout(const Duration(seconds: 15));
+                      .timeout(const Duration(seconds: 5));
                   if (rawProjects != null && rawProjects.isNotEmpty) {
                     setStage('Moving existing projects to dedicated local storage…');
                     await _writeTextAtomically(projectsFile, rawProjects)
                         .timeout(const Duration(seconds: 20));
                     if (!mounted || attempt != _startupAttempt) return;
                   }
+                } else {
+                  rawProjects = null;
                 }
               } catch (error) {
-                _startupWatchdog?.cancel();
-                if (mounted && attempt == _startupAttempt) {
-                  setState(() {
-                    _startupError = 'Could not open or migrate local project storage ($error). '
-                        'The previous saved data was not intentionally deleted. Tap Retry startup.';
-                    _ready = true;
-                  });
-                }
-                return;
+                // Recover to an empty in-memory project list when local project storage is
+                // missing/unreadable. Never delete the unreadable file or legacy preference.
+                // The user can still reach the initial setup screen instead of being locked out.
+                debugPrint('Startup: project storage unavailable; starting with an empty list. $error');
+                projectStorageReady = false;
+                rawProjects = null;
               }
 
               setStage('Reading saved projects…');
@@ -2294,53 +2292,58 @@ jobs:
                   _projects = [];
                 }
               } catch (error) {
-                _startupWatchdog?.cancel();
-                if (mounted && attempt == _startupAttempt) {
-                  setState(() {
-                    _startupError = 'Could not restore saved projects ($error). The original local data is still stored. '
-                        'Tap Retry startup; if this repeats, share this exact message.';
-                    _ready = true;
-                  });
-                }
-                return;
+                // Malformed or incompatible project data should not brick the whole app.
+                // Start with an empty in-memory list and preserve the original file for recovery.
+                debugPrint('Startup: saved projects could not be parsed; starting with an empty list. $error');
+                projectDataRestored = false;
+                _projects = <AppProject>[];
               }
 
-              // Only remove the large legacy preference once the new file has been read and
-              // parsed successfully. If parsing fails, retain both copies for recovery.
-              if (!_legacyProjectPreferenceRemoved) {
+              // Delete the legacy copy only when the dedicated storage and project data were
+              // both read successfully. Never discard the only recoverable copy after an error.
+              if (preferencesAvailable && projectStorageReady && projectDataRestored && !_legacyProjectPreferenceRemoved) {
                 try {
-                  await prefs.remove('projects_v1').timeout(const Duration(seconds: 8));
+                  await prefs.remove('projects_v1').timeout(const Duration(seconds: 3));
                   _legacyProjectPreferenceRemoved = true;
-                } catch (_) {}
+                } catch (_) {
+                  // Keep the legacy copy if the preferences plugin is unavailable.
+                }
               }
 
               setStage('Loading backup and app settings…');
-              try {
-                final rawBackups = await prefs.getString('backup_repositories_v1')
-                    .timeout(const Duration(seconds: 8));
-                if (rawBackups != null && rawBackups.isNotEmpty) {
-                  final decoded = jsonDecode(rawBackups);
-                  if (decoded is Map) {
-                    _backupRepositories = decoded.map<String, String>(
-                      (key, value) => MapEntry<String, String>(
-                        key.toString().toLowerCase(),
-                        normalizeRepository(value.toString()),
-                      ),
-                    );
+              if (preferencesAvailable) {
+                try {
+                  final rawBackups = await prefs.getString('backup_repositories_v1')
+                      .timeout(const Duration(seconds: 3));
+                  if (rawBackups != null && rawBackups.isNotEmpty) {
+                    final decoded = jsonDecode(rawBackups);
+                    if (decoded is Map) {
+                      _backupRepositories = decoded.map<String, String>(
+                        (key, value) => MapEntry<String, String>(
+                          key.toString().toLowerCase(),
+                          normalizeRepository(value.toString()),
+                        ),
+                      );
+                    }
                   }
+                } catch (_) {
+                  _backupRepositories = <String, String>{};
                 }
-              } catch (_) {
-                _backupRepositories = <String, String>{};
-              }
 
-              try {
-                final savedFailover = await prefs.getBool('auto_failover').timeout(const Duration(seconds: 8));
-                final savedInterval = await prefs.getInt('backup_interval_minutes').timeout(const Duration(seconds: 8)) ?? 15;
-                final savedRepository = await prefs.getString('repository').timeout(const Duration(seconds: 8));
-                _autoFailover = savedFailover ?? true;
-                _backupIntervalMinutes = _supportedBackupIntervals.contains(savedInterval) ? savedInterval : 15;
-                _repository = normalizeRepository(savedRepository ?? compiledRepository);
-              } catch (_) {
+                try {
+                  final savedFailover = await prefs.getBool('auto_failover').timeout(const Duration(seconds: 3));
+                  final savedInterval = await prefs.getInt('backup_interval_minutes').timeout(const Duration(seconds: 3)) ?? 15;
+                  final savedRepository = await prefs.getString('repository').timeout(const Duration(seconds: 3));
+                  _autoFailover = savedFailover ?? true;
+                  _backupIntervalMinutes = _supportedBackupIntervals.contains(savedInterval) ? savedInterval : 15;
+                  _repository = normalizeRepository(savedRepository ?? compiledRepository);
+                } catch (_) {
+                  _autoFailover = true;
+                  _backupIntervalMinutes = 15;
+                  _repository = normalizeRepository(compiledRepository);
+                }
+              } else {
+                _backupRepositories = <String, String>{};
                 _autoFailover = true;
                 _backupIntervalMinutes = 15;
                 _repository = normalizeRepository(compiledRepository);
@@ -2943,8 +2946,18 @@ jobs:
                 if (mounted) setState(() { _busy = false; _error = error; });
                 return;
               }
-              await widget.onSetup(GitHubAccount(username: username, token: token));
-              if (mounted) setState(() => _busy = false);
+              try {
+                await widget.onSetup(GitHubAccount(username: username, token: token));
+                if (mounted) setState(() => _busy = false);
+              } catch (error) {
+                if (mounted) {
+                  setState(() {
+                    _busy = false;
+                    _error = 'GitHub was verified, but the token could not be saved securely on this device. '
+                        'Check device security/storage and retry. Details: $error';
+                  });
+                }
+              }
             }
           
             @override
