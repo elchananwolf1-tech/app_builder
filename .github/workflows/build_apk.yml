@@ -1,4 +1,4 @@
-name: Build Simple App Builder or a Flutter project
+ name: Build Simple App Builder or a Flutter project
 
 # Manual runs build the Simple App Builder APK. App requests build an APK or AAB.
 # A project created inside the app triggers repository_dispatch with a per-build payload.
@@ -504,23 +504,20 @@ jobs:
           BUILDER_PACKAGE="${BUILDER_ORG}.simple_app_builder"
           flutter create --org "$BUILDER_ORG" --project-name simple_app_builder "$BUILDER_DIR"
           cd "$BUILDER_DIR"
-          # Pin package generations to the APIs used by the embedded app. dynamic_color 2.x
-          # switched DynamicColorBuilder to material_ui.ColorScheme, which is not compatible
-          # with Flutter MaterialApp's Flutter ColorScheme without an explicit conversion.
-          # Pin 1.9.0: it supports AGP 9 and still exposes Flutter's ColorScheme API;
-          # dynamic_color 2.x moved the builder to material_ui.ColorScheme.
+          # Keep startup independent of the platform dynamic-color channel. The app uses
+          # a built-in Material color scheme so the first Flutter frame never waits for
+          # an optional native color-provider plugin.
           # file_picker 12.3.0
           # and share_plus 13.3.1 require Flutter/Dart 3.38+/3.10+; the stable channel
           # selected above supplies the current compatible SDK. cross_file 0.3.x is required
           # by both plugins; do not let Pub select the incompatible 0.4.x line.
-          flutter pub add flutter_secure_storage shared_preferences http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 dynamic_color:1.9.0 file_picker:12.3.0 image:^4.12.0 crypto
+          flutter pub add flutter_secure_storage shared_preferences shared_preferences_android http flutter_code_editor flutter_highlight highlight archive url_launcher path_provider open_filex cross_file:^0.3.5+4 share_plus:^13.3.1 file_picker:12.3.0 image:^4.12.0 crypto
           python3 - <<'PYDEPS'
           from pathlib import Path
           import re
           pubspec = Path('pubspec.yaml')
           text = pubspec.read_text(encoding='utf-8')
           replacements = {
-              'dynamic_color': '^1.9.0',
               'file_picker': '^12.3.0',
               'share_plus': '^13.3.1',
               'cross_file': '^0.3.5+4',
@@ -542,9 +539,9 @@ jobs:
           
           import 'package:archive/archive.dart';
           import 'package:cross_file/cross_file.dart';
-          import 'package:dynamic_color/dynamic_color.dart';
           import 'package:file_picker/file_picker.dart';
           import 'package:flutter/material.dart';
+          import 'package:flutter/foundation.dart' show compute;
           import 'package:flutter_code_editor/flutter_code_editor.dart';
           import 'package:flutter_highlight/themes/github.dart';
           import 'package:flutter_highlight/themes/monokai-sublime.dart';
@@ -560,6 +557,7 @@ jobs:
           import 'package:path_provider/path_provider.dart';
           import 'package:share_plus/share_plus.dart';
           import 'package:shared_preferences/shared_preferences.dart';
+          import 'package:shared_preferences_android/shared_preferences_android.dart';
           import 'package:url_launcher/url_launcher.dart';
           import 'package:crypto/crypto.dart' as crypto;
           import 'dart:math' as math;
@@ -570,6 +568,59 @@ jobs:
           );
           const String workflowFile = 'build_apk.yml';
           const FlutterSecureStorage secureStorage = FlutterSecureStorage();
+
+          // Decode large persisted JSON outside the UI isolate to keep startup responsive.
+          Object? _decodeJsonInBackground(String source) => jsonDecode(source);
+
+          // Project source trees can be large; keep them out of SharedPreferences so Android
+          // doesn't need to deserialize the entire project database with the small settings.
+          Future<File> _projectsStorageFile() async {
+            final root = await getApplicationSupportDirectory();
+            final folder = Directory('${root.path}${Platform.pathSeparator}simple_app_builder');
+            await folder.create(recursive: true);
+            return File('${folder.path}${Platform.pathSeparator}projects_v1.json');
+          }
+
+          Future<void> _writeTextAtomically(File target, String value) async {
+            final temp = File('${target.path}.tmp');
+            await temp.writeAsString(value, flush: true);
+            try {
+              await temp.rename(target.path);
+            } on FileSystemException {
+              // Android normally replaces on rename. This fallback handles platforms that
+              // refuse replacing an existing file while keeping the completed temp file.
+              if (await target.exists()) await target.delete();
+              await temp.rename(target.path);
+            }
+          }
+
+          // Use the existing Android SharedPreferences file but read only individual keys.
+          // The legacy cached preferences API fetches the entire store into Dart,
+          // which is expensive when an old version stored all project source in one giant value.
+          const SharedPreferencesAsyncAndroidOptions _localPrefsOptions =
+              SharedPreferencesAsyncAndroidOptions(
+            backend: SharedPreferencesAndroidBackendLibrary.SharedPreferences,
+            originalSharedPreferencesOptions: AndroidSharedPreferencesStoreOptions(
+              fileName: 'FlutterSharedPreferences',
+            ),
+          );
+
+          class LocalPreferences {
+            LocalPreferences() : _preferences = SharedPreferencesAsync(options: _localPrefsOptions);
+
+            final SharedPreferencesAsync _preferences;
+            String _key(String key) => 'flutter.$key';
+
+            Future<String?> getString(String key) => _preferences.getString(_key(key));
+            Future<bool?> getBool(String key) => _preferences.getBool(_key(key));
+            Future<int?> getInt(String key) => _preferences.getInt(_key(key));
+            Future<void> setString(String key, String value) => _preferences.setString(_key(key), value);
+            Future<void> setBool(String key, bool value) => _preferences.setBool(_key(key), value);
+            Future<void> setInt(String key, int value) => _preferences.setInt(_key(key), value);
+            Future<void> remove(String key) => _preferences.remove(_key(key));
+          }
+
+          final LocalPreferences localPreferences = LocalPreferences();
           
           Uint8List _buildLauncherIconPreview(Map<String, Object?> args) {
             final sourceBytes = args['bytes'] as Uint8List;
@@ -2020,6 +2071,11 @@ jobs:
           
           class _SimpleAppBuilderState extends State<SimpleAppBuilder> with WidgetsBindingObserver {
             bool _ready = false;
+            String? _startupError;
+            String _startupStatus = 'Preparing startup…';
+            Timer? _startupWatchdog;
+            int _startupAttempt = 0;
+            bool _legacyProjectPreferenceRemoved = false;
             List<GitHubAccount> _accounts = [];
             List<AppProject> _projects = [];
             bool _autoFailover = true;
@@ -2066,50 +2122,257 @@ jobs:
               _backupTimer?.cancel();
               _backupDebounce?.cancel();
               _backupRetryTimer?.cancel();
+              _startupWatchdog?.cancel();
               super.dispose();
             }
           
             Future<void> _loadState() async {
-              final prefs = await SharedPreferences.getInstance();
+              final int attempt = ++_startupAttempt;
+              _startupWatchdog?.cancel();
+              if (mounted) {
+                setState(() {
+                  _ready = false;
+                  _startupError = null;
+                  _startupStatus = 'Starting app…';
+                });
+              }
+
+              // If any stage stalls, stop showing a spinner and expose the last stage.
+              // Progress updates renew this watchdog; storage/JSON awaits have their own limits.
+              void setStage(String message) {
+                if (!mounted || attempt != _startupAttempt) return;
+                setState(() => _startupStatus = message);
+                _startupWatchdog?.cancel();
+                _startupWatchdog = Timer(const Duration(seconds: 20), () {
+                  if (!mounted || attempt != _startupAttempt || _ready) return;
+                  _startupAttempt++; // Prevent a timed-out attempt overwriting its recovery screen.
+                  setState(() {
+                    _startupError = 'Startup stalled during: $message. Your saved data has not been deleted. '
+                        'Tap Retry startup. If it repeats, share this exact message.';
+                    _ready = true;
+                  });
+                });
+              }
+
+              setStage('Opening local app storage…');
+              List<Object?> results;
               try {
-                final rawAccounts = await secureStorage.read(key: 'github_accounts_v1');
-                if (rawAccounts != null) {
-                  _accounts = (jsonDecode(rawAccounts) as List<dynamic>)
+                results = await Future.wait<Object?>(<Future<Object?>>[
+                  localPreferences.getString('repository')
+                      .timeout(const Duration(seconds: 8))
+                      .then<Object?>((value) => <String, Object?>{'ok': true, 'value': value})
+                      .catchError((Object error) => <String, Object?>{'ok': false, 'error': error.toString()}),
+                  secureStorage.read(key: 'github_accounts_v1')
+                      .timeout(const Duration(seconds: 8))
+                      .then<Object?>((value) => <String, Object?>{'ok': true, 'value': value})
+                      .catchError((Object error) => <String, Object?>{'ok': false, 'error': error.toString()}),
+                ]).timeout(
+                  const Duration(seconds: 9),
+                  onTimeout: () => <Object?>[null, null],
+                );
+              } catch (error) {
+                results = <Object?>[
+                  <String, Object?>{'ok': false, 'error': error.toString()},
+                  <String, Object?>{'ok': false, 'error': error.toString()},
+                ];
+              }
+              if (!mounted || attempt != _startupAttempt) return;
+
+              final prefsResult = results.isNotEmpty && results[0] is Map<String, Object?>
+                  ? results[0] as Map<String, Object?>
+                  : null;
+              final accountsResult = results.length > 1 && results[1] is Map<String, Object?>
+                  ? results[1] as Map<String, Object?>
+                  : null;
+              if (prefsResult == null ||
+                  prefsResult['ok'] != true ||
+                  accountsResult == null ||
+                  accountsResult['ok'] != true) {
+                _startupWatchdog?.cancel();
+                if (mounted && attempt == _startupAttempt) {
+                  setState(() {
+                    _startupError = 'Could not open local app storage. Your saved projects have not been reset. '
+                        'Check device storage, then tap Retry startup.';
+                    _ready = true;
+                  });
+                }
+                return;
+              }
+
+              final LocalPreferences prefs = localPreferences;
+              final rawAccounts = accountsResult['value'] as String?;
+              setStage('Reading saved account information…');
+              try {
+                if (rawAccounts != null && rawAccounts.isNotEmpty) {
+                  final Object? decodedAccounts = await compute<String, Object?>(
+                    _decodeJsonInBackground,
+                    rawAccounts,
+                  ).timeout(const Duration(seconds: 10));
+                  if (!mounted || attempt != _startupAttempt) return;
+                  if (decodedAccounts is! List<dynamic>) {
+                    throw const FormatException('Saved account data is not a list.');
+                  }
+                  _accounts = decodedAccounts
                       .whereType<Map<String, dynamic>>()
                       .map(GitHubAccount.fromJson)
-                      .where((a) => a.username.isNotEmpty && a.token.isNotEmpty)
+                      .where((account) => account.username.isNotEmpty && account.token.isNotEmpty)
                       .toList();
+                } else {
+                  _accounts = [];
                 }
-              } catch (_) {
-                _accounts = [];
-              }
-              try {
-                final rawProjects = prefs.getString('projects_v1');
-                if (rawProjects != null) {
-                  _projects = (jsonDecode(rawProjects) as List<dynamic>)
-                      .whereType<Map<String, dynamic>>()
-                      .map(AppProject.fromJson)
-                      .toList();
+              } catch (error) {
+                _startupWatchdog?.cancel();
+                if (mounted && attempt == _startupAttempt) {
+                  setState(() {
+                    _startupError = 'Could not read saved account data ($error). No local data was deleted. '
+                        'Tap Retry startup; if this repeats, share this message.';
+                    _ready = true;
+                  });
                 }
-              } catch (_) {
-                _projects = [];
+                return;
               }
+
+              setStage('Opening separate project storage…');
+              String? rawProjects;
               try {
-                final rawBackups = prefs.getString('backup_repositories_v1');
-                if (rawBackups != null) {
+                final projectsFile = await _projectsStorageFile().timeout(const Duration(seconds: 8));
+                final fileExists = await projectsFile.exists().timeout(const Duration(seconds: 5));
+                if (fileExists) {
+                  rawProjects = await projectsFile.readAsString().timeout(const Duration(seconds: 15));
+                } else {
+                  // One-time migration from the previous version, which stored the complete
+                  // source tree in SharedPreferences. Only remove the old value after the new
+                  // file has been written successfully.
+                  rawProjects = await prefs.getString('projects_v1')
+                      .timeout(const Duration(seconds: 15));
+                  if (rawProjects != null && rawProjects.isNotEmpty) {
+                    setStage('Moving existing projects to dedicated local storage…');
+                    await _writeTextAtomically(projectsFile, rawProjects)
+                        .timeout(const Duration(seconds: 20));
+                    if (!mounted || attempt != _startupAttempt) return;
+                  }
+                }
+              } catch (error) {
+                _startupWatchdog?.cancel();
+                if (mounted && attempt == _startupAttempt) {
+                  setState(() {
+                    _startupError = 'Could not open or migrate local project storage ($error). '
+                        'The previous saved data was not intentionally deleted. Tap Retry startup.';
+                    _ready = true;
+                  });
+                }
+                return;
+              }
+
+              setStage('Reading saved projects…');
+              try {
+                if (rawProjects != null && rawProjects.isNotEmpty) {
+                  // JSON decoding can be expensive when projects contain large source trees.
+                  // Keep it on a background isolate rather than blocking the Flutter UI thread.
+                  final Object? decodedProjects = await compute<String, Object?>(
+                    _decodeJsonInBackground,
+                    rawProjects,
+                  ).timeout(const Duration(seconds: 15));
+                  if (!mounted || attempt != _startupAttempt) return;
+                  if (decodedProjects is! List<dynamic>) {
+                    throw const FormatException('Saved projects data is not a list.');
+                  }
+                  final restored = <AppProject>[];
+                  for (var index = 0; index < decodedProjects.length; index++) {
+                    final item = decodedProjects[index];
+                    if (item is Map<String, dynamic>) {
+                      restored.add(AppProject.fromJson(item));
+                    }
+                    if ((index + 1) % 20 == 0 || index + 1 == decodedProjects.length) {
+                      setStage('Restoring projects (${index + 1}/${decodedProjects.length})…');
+                      await Future<void>.delayed(Duration.zero);
+                      if (!mounted || attempt != _startupAttempt) return;
+                    }
+                  }
+                  _projects = restored;
+                } else {
+                  _projects = [];
+                }
+              } catch (error) {
+                _startupWatchdog?.cancel();
+                if (mounted && attempt == _startupAttempt) {
+                  setState(() {
+                    _startupError = 'Could not restore saved projects ($error). The original local data is still stored. '
+                        'Tap Retry startup; if this repeats, share this exact message.';
+                    _ready = true;
+                  });
+                }
+                return;
+              }
+
+              // Only remove the large legacy preference once the new file has been read and
+              // parsed successfully. If parsing fails, retain both copies for recovery.
+              if (!_legacyProjectPreferenceRemoved) {
+                try {
+                  await prefs.remove('projects_v1').timeout(const Duration(seconds: 8));
+                  _legacyProjectPreferenceRemoved = true;
+                } catch (_) {}
+              }
+
+              setStage('Loading backup and app settings…');
+              try {
+                final rawBackups = await prefs.getString('backup_repositories_v1')
+                    .timeout(const Duration(seconds: 8));
+                if (rawBackups != null && rawBackups.isNotEmpty) {
                   final decoded = jsonDecode(rawBackups);
-                  if (decoded is Map) _backupRepositories = decoded.map<String, String>((key, value) => MapEntry<String, String>(key.toString().toLowerCase(), normalizeRepository(value.toString())));
+                  if (decoded is Map) {
+                    _backupRepositories = decoded.map<String, String>(
+                      (key, value) => MapEntry<String, String>(
+                        key.toString().toLowerCase(),
+                        normalizeRepository(value.toString()),
+                      ),
+                    );
+                  }
                 }
-              } catch (_) { _backupRepositories = <String, String>{}; }
-              _autoFailover = prefs.getBool('auto_failover') ?? true;
-              final savedInterval = prefs.getInt('backup_interval_minutes') ?? 15;
-              _backupIntervalMinutes = _supportedBackupIntervals.contains(savedInterval) ? savedInterval : 15;
+              } catch (_) {
+                _backupRepositories = <String, String>{};
+              }
+
+              try {
+                final savedFailover = await prefs.getBool('auto_failover').timeout(const Duration(seconds: 8));
+                final savedInterval = await prefs.getInt('backup_interval_minutes').timeout(const Duration(seconds: 8)) ?? 15;
+                final savedRepository = await prefs.getString('repository').timeout(const Duration(seconds: 8));
+                _autoFailover = savedFailover ?? true;
+                _backupIntervalMinutes = _supportedBackupIntervals.contains(savedInterval) ? savedInterval : 15;
+                _repository = normalizeRepository(savedRepository ?? compiledRepository);
+              } catch (_) {
+                _autoFailover = true;
+                _backupIntervalMinutes = 15;
+                _repository = normalizeRepository(compiledRepository);
+              }
+
+              if (!mounted || attempt != _startupAttempt) return;
+              setStage('Finishing startup…');
               _configureBackupTimer();
-              _repository = normalizeRepository(prefs.getString('repository') ?? compiledRepository);
-              if (mounted) setState(() => _ready = true);
-              if (_accounts.isNotEmpty) unawaited(_synchronizeBackups(restoreCloud: true));
+              _startupWatchdog?.cancel();
+              if (mounted && attempt == _startupAttempt) {
+                setState(() {
+                  _startupError = null;
+                  _ready = true;
+                  _startupStatus = 'Ready';
+                });
+              }
+              if (_accounts.isNotEmpty) {
+                unawaited(_synchronizeBackups(restoreCloud: true));
+              }
             }
-          
+
+            Future<void> _retryLoadState() async {
+              if (!mounted) return;
+              _startupWatchdog?.cancel();
+              setState(() {
+                _ready = false;
+                _startupError = null;
+                _startupStatus = 'Retrying startup…';
+              });
+              await _loadState();
+            }
+
             Future<void> _saveAccounts(List<GitHubAccount> accounts) async {
               _accounts = List<GitHubAccount>.from(accounts);
               await secureStorage.write(
@@ -2125,9 +2388,22 @@ jobs:
             }
           
             Future<void> _storeProjectsLocally(List<AppProject> projects) async {
-              _projects = List<AppProject>.from(projects);
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setString('projects_v1', jsonEncode(_projects.map((p) => p.toJson()).toList()));
+              final nextProjects = List<AppProject>.from(projects);
+              final encoded = jsonEncode(nextProjects.map((project) => project.toJson()).toList());
+              final file = await _projectsStorageFile();
+              await _writeTextAtomically(file, encoded);
+
+              // The legacy settings entry may be large. Now that the independent file is safe,
+              // remove it so future SharedPreferences initialization stays lightweight.
+              try {
+                if (!_legacyProjectPreferenceRemoved) {
+                  await localPreferences.remove('projects_v1');
+                  _legacyProjectPreferenceRemoved = true;
+                }
+              } catch (_) {
+                // Project data is already written to its dedicated file; keep that copy safe.
+              }
+              _projects = nextProjects;
               if (mounted) setState(() {});
             }
           
@@ -2159,8 +2435,7 @@ jobs:
             }
           
             Future<void> _persistBackupRepositoryMap() async {
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setString('backup_repositories_v1', jsonEncode(_backupRepositories));
+              await localPreferences.setString('backup_repositories_v1', jsonEncode(_backupRepositories));
             }
           
             void _scheduleBackupRetry({required String reason}) {
@@ -2288,15 +2563,13 @@ jobs:
           
             Future<void> _saveFailover(bool enabled) async {
               _autoFailover = enabled;
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setBool('auto_failover', enabled);
+              await localPreferences.setBool('auto_failover', enabled);
               if (mounted) setState(() {});
             }
 
             Future<void> _saveBackupInterval(int minutes) async {
               if (!_supportedBackupIntervals.contains(minutes)) return;
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setInt('backup_interval_minutes', minutes);
+              await localPreferences.setInt('backup_interval_minutes', minutes);
               _backupIntervalMinutes = minutes;
               _configureBackupTimer();
               if (mounted) setState(() => _backupStatus = 'Backup frequency updated: every $minutes minute(s) while the app is active.');
@@ -2305,8 +2578,7 @@ jobs:
           
             Future<void> _saveRepository(String repository) async {
               _repository = normalizeRepository(repository);
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setString('repository', _repository);
+              await localPreferences.setString('repository', _repository);
               if (mounted) setState(() {});
             }
           
@@ -2338,51 +2610,118 @@ jobs:
                 );
           
             @override
-            Widget build(BuildContext context) => DynamicColorBuilder(
-                  builder: (ColorScheme? lightDynamic, ColorScheme? darkDynamic) {
-                    // Explicit types prevent inference from widening the values to Diagnosticable.
-                    final ColorScheme light = lightDynamic ??
-                        ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4));
-                    final ColorScheme dark = darkDynamic ??
-                        ColorScheme.fromSeed(
-                          seedColor: const Color(0xFFD0BCFF),
-                          brightness: Brightness.dark,
-                        );
-                    return MaterialApp(
-                      title: 'Simple App Builder',
-                      debugShowCheckedModeBanner: false,
-                      theme: _theme(light),
-                      darkTheme: _theme(dark),
-                      themeMode: ThemeMode.system,
-                      home: !_ready
-                          ? const _LoadingScreen()
-                          : _accounts.isEmpty
-                              ? SetupScreen(onSetup: (account) async {
-                                  await _saveAccounts([account]);
-                                })
-                              : DashboardScreen(
-                                  accounts: _accounts,
-                                  projects: _projects,
-                                  autoFailover: _autoFailover,
-                                  repository: _repository,
-                                  backupStatus: _backupStatus,
-                                  backupIntervalMinutes: _backupIntervalMinutes,
-                                  apiFactory: _api,
-                                  onAccountsChanged: _saveAccounts,
-                                  onProjectsChanged: _saveProjects,
-                                  onFailoverChanged: _saveFailover,
-                                  onRepositoryChanged: _saveRepository,
-                                  onBackupIntervalChanged: _saveBackupInterval,
-                                ),
-                    );
-                  },
-                );
+            Widget build(BuildContext context) {
+              // Use a deterministic built-in color scheme at startup. Dynamic system
+              // colors are cosmetic and are not required to initialize the application.
+              final ColorScheme light =
+                  ColorScheme.fromSeed(seedColor: const Color(0xFF6750A4));
+              final ColorScheme dark = ColorScheme.fromSeed(
+                seedColor: const Color(0xFFD0BCFF),
+                brightness: Brightness.dark,
+              );
+              return MaterialApp(
+                title: 'Simple App Builder',
+                debugShowCheckedModeBanner: false,
+                theme: _theme(light),
+                darkTheme: _theme(dark),
+                themeMode: ThemeMode.system,
+                home: _startupError != null
+                    ? _StartupRecoveryScreen(
+                        message: _startupError!,
+                        onRetry: () => unawaited(_retryLoadState()),
+                      )
+                    : !_ready
+                        ? _LoadingScreen(message: _startupStatus)
+                        : _accounts.isEmpty
+                            ? SetupScreen(onSetup: (account) async {
+                                await _saveAccounts([account]);
+                              })
+                            : DashboardScreen(
+                                accounts: _accounts,
+                                projects: _projects,
+                                autoFailover: _autoFailover,
+                                repository: _repository,
+                                backupStatus: _backupStatus,
+                                backupIntervalMinutes: _backupIntervalMinutes,
+                                apiFactory: _api,
+                                onAccountsChanged: _saveAccounts,
+                                onProjectsChanged: _saveProjects,
+                                onFailoverChanged: _saveFailover,
+                                onRepositoryChanged: _saveRepository,
+                                onBackupIntervalChanged: _saveBackupInterval,
+                              ),
+              );
+            }
           }
           
-          class _LoadingScreen extends StatelessWidget {
-            const _LoadingScreen();
+          class _StartupRecoveryScreen extends StatelessWidget {
+            const _StartupRecoveryScreen({required this.message, required this.onRetry});
+
+            final String message;
+            final VoidCallback onRetry;
+
             @override
-            Widget build(BuildContext context) => const Scaffold(body: Center(child: CircularProgressIndicator()));
+            Widget build(BuildContext context) => Scaffold(
+                  body: SafeArea(
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 440),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              const Icon(Icons.storage_rounded, size: 52),
+                              const SizedBox(height: 20),
+                              Text(
+                                'Could not finish startup',
+                                style: Theme.of(context).textTheme.headlineSmall,
+                                textAlign: TextAlign.center,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(message, textAlign: TextAlign.center),
+                              const SizedBox(height: 24),
+                              FilledButton.icon(
+                                onPressed: onRetry,
+                                icon: const Icon(Icons.refresh),
+                                label: const Text('Retry startup'),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+          }
+
+          class _LoadingScreen extends StatelessWidget {
+            const _LoadingScreen({required this.message});
+            final String message;
+
+            @override
+            Widget build(BuildContext context) => Scaffold(
+                  body: SafeArea(
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: <Widget>[
+                            const CircularProgressIndicator(),
+                            const SizedBox(height: 20),
+                            Text(message, textAlign: TextAlign.center),
+                            const SizedBox(height: 8),
+                            const Text(
+                              'If this step stops progressing, the app will show a recovery message.',
+                              textAlign: TextAlign.center,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                );
           }
           
           class _GuideArticle {
