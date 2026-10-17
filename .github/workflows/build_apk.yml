@@ -545,7 +545,7 @@ jobs:
           import 'package:flutter_code_editor/flutter_code_editor.dart';
           import 'package:flutter_highlight/themes/github.dart';
           import 'package:flutter_highlight/themes/monokai-sublime.dart';
-          import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+          import 'package:flutter_secure_storage/flutter_secure_storage.dart' as secure_storage;
           import 'package:highlight/languages/dart.dart' as dart_language;
           import 'package:highlight/languages/java.dart' as java_language;
           import 'package:highlight/languages/kotlin.dart' as kotlin_language;
@@ -569,8 +569,8 @@ jobs:
           const String workflowFile = 'build_apk.yml';
           // Never let a transient Android Keystore/decryption problem prevent first launch.
           // Keep existing secure data intact on read errors; the startup flow handles failures.
-          const FlutterSecureStorage secureStorage = FlutterSecureStorage(
-            aOptions: AndroidOptions(resetOnError: false),
+          const secure_storage.FlutterSecureStorage secureStorage = secure_storage.FlutterSecureStorage(
+            aOptions: secure_storage.AndroidOptions(resetOnError: false),
           );
 
           // Decode large persisted JSON outside the UI isolate to keep startup responsive.
