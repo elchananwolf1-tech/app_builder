@@ -267,15 +267,13 @@ jobs:
               root.insert(0, permission)
           tree.write(manifest, encoding='utf-8', xml_declaration=True)
 
-          # AGP 9 enables built-in Kotlin and its new DSL by default. Many current
-          # Flutter plugins still apply `kotlin-android` and use the legacy DSL.
-          # Opt into the compatibility path while the generated app and dependencies
-          # are not all migrated. This is idempotent and can be removed once the
-          # selected Flutter/plugin set is fully AGP-9 compatible.
+          # Use conservative Gradle performance defaults. AGP 9 compatibility is handled
+          # by pinning the generated Android toolchain to AGP 8.11.1 below; AGP 9 may ignore
+          # legacy DSL opt-out properties, so those flags are deliberately not relied upon.
           properties = project / 'android/gradle.properties'
           properties.parent.mkdir(parents=True, exist_ok=True)
           prop_text = properties.read_text(encoding='utf-8') if properties.exists() else ''
-          for key, value in (('android.builtInKotlin', 'false'), ('android.newDsl', 'false'), ('org.gradle.caching', 'true'), ('org.gradle.parallel', 'true'), ('org.gradle.workers.max', '4'), ('org.gradle.jvmargs', '-Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -Dfile.encoding=UTF-8')):
+          for key, value in (('org.gradle.caching', 'true'), ('org.gradle.parallel', 'true'), ('org.gradle.workers.max', '4'), ('org.gradle.jvmargs', '-Xmx3G -XX:MaxMetaspaceSize=1G -XX:ReservedCodeCacheSize=512m -Dfile.encoding=UTF-8')):
               if re.search(rf'(?m)^\s*{re.escape(key)}\s*=', prop_text):
                   prop_text = re.sub(rf'(?m)^\s*{re.escape(key)}\s*=.*$', f'{key}={value}', prop_text)
               else:
@@ -292,10 +290,34 @@ jobs:
           data = data.replace('minSdk = flutter.minSdkVersion', 'minSdk = 23')
           data = data.replace('minSdkVersion flutter.minSdkVersion', 'minSdkVersion 23')
           gradle.write_text(data, encoding='utf-8')
+
+          # Pin generated Android projects to a stable AGP 8 toolchain. AGP 9 ignores
+          # legacy DSL opt-outs and breaks a number of existing Flutter plugins.
+          android_dir = project / 'android'
+          for candidate in (android_dir / 'settings.gradle.kts', android_dir / 'settings.gradle',
+                            android_dir / 'build.gradle.kts', android_dir / 'build.gradle'):
+              if not candidate.is_file():
+                  continue
+              source = candidate.read_text(encoding='utf-8')
+              source = re.sub(r'(id\s*\(?\s*["\']com\.android\.(?:application|library)["\']\s*\)?\s*version\s*["\'])[^"\']+(["\'])', r'\g<1>8.11.1\2', source)
+              source = re.sub(r'(com\.android\.tools\.build:gradle:)[0-9][A-Za-z0-9_.-]*', r'\g<1>8.11.1', source)
+              candidate.write_text(source, encoding='utf-8')
+          version_catalog = android_dir / 'gradle/libs.versions.toml'
+          if version_catalog.is_file():
+              catalog = version_catalog.read_text(encoding='utf-8')
+              catalog = re.sub(r'(?m)^(\s*(?:agp|androidGradlePlugin|android_gradle_plugin)\s*=\s*")[^"]+(")', r'\g<1>8.11.1\2', catalog)
+              version_catalog.write_text(catalog, encoding='utf-8')
+          wrapper = android_dir / 'gradle/wrapper/gradle-wrapper.properties'
+          if wrapper.is_file():
+              wrapper_text = wrapper.read_text(encoding='utf-8')
+              wrapper_text = re.sub(r'gradle-[0-9][A-Za-z0-9_.-]*-(?:bin|all)\.zip', 'gradle-8.13-bin.zip', wrapper_text)
+              wrapper.write_text(wrapper_text, encoding='utf-8')
+          print('Pinned generated Android project to AGP 8.11.1 / Gradle 8.13 where a version declaration is present.')
           PY
           cat > "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" <<'PYPLUGIN'
-          import re, sys
+          import json, re, sys
           from pathlib import Path
+          from urllib.parse import unquote, urlparse
 
           project_root = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else None
           def detect_agp_version():
@@ -320,11 +342,25 @@ jobs:
               return None
 
           agp_version = detect_agp_version()
-          cache = Path.home() / '.pub-cache' / 'hosted' / 'pub.dev'
+          package_roots = []
+          package_config = project_root / '.dart_tool/package_config.json' if project_root else None
+          if package_config and package_config.is_file():
+              try:
+                  config = json.loads(package_config.read_text(encoding='utf-8'))
+                  for item in config.get('packages', []):
+                      uri = urlparse(item.get('rootUri', ''))
+                      if uri.scheme == 'file':
+                          package_roots.append(Path(unquote(uri.path)).resolve())
+                      elif not uri.scheme:
+                          package_roots.append((package_config.parent / unquote(uri.path)).resolve())
+              except Exception as exc:
+                  print(f'::warning::Could not read package_config.json for Kotlin preflight: {exc}')
+          if not package_roots:
+              cache = Path.home() / '.pub-cache' / 'hosted' / 'pub.dev'
+              if cache.exists(): package_roots = list(cache.glob('*'))
           patched = []
           inspected = 0
-          if cache.exists():
-              for package_dir in cache.glob('*'):
+          for package_dir in package_roots:
                   android_dir = package_dir / 'android'
                   for gradle in (android_dir / 'build.gradle', android_dir / 'build.gradle.kts'):
                       if not gradle.is_file():
@@ -576,6 +612,7 @@ jobs:
               this.iconBase64,
               this.repository = '',
               this.dynamicThemedIcon = true,
+              this.hasMainFile = true,
               this.buildFormat = 'apk',
               this.signRelease = false,
               this.updatedAtMillis = 0,
@@ -596,6 +633,7 @@ jobs:
             final String androidDependencies;
             final String? iconBase64;
             final bool dynamicThemedIcon;
+            final bool hasMainFile;
             final String repository;
             final String buildFormat;
             final bool signRelease;
@@ -613,6 +651,7 @@ jobs:
               String? iconBase64,
               String? repository,
               bool? dynamicThemedIcon,
+              bool? hasMainFile,
               String? buildFormat,
               bool? signRelease,
               int? updatedAtMillis,
@@ -630,6 +669,7 @@ jobs:
                   iconBase64: clearIcon ? null : (iconBase64 ?? this.iconBase64),
                   repository: repository ?? this.repository,
                   dynamicThemedIcon: dynamicThemedIcon ?? this.dynamicThemedIcon,
+                  hasMainFile: hasMainFile ?? this.hasMainFile,
                   buildFormat: buildFormat ?? this.buildFormat,
                   signRelease: signRelease ?? this.signRelease,
                   updatedAtMillis: updatedAtMillis ?? this.updatedAtMillis,
@@ -648,6 +688,7 @@ jobs:
                   'iconBase64': iconBase64,
                   'repository': repository,
                   'dynamicThemedIcon': dynamicThemedIcon,
+                  'hasMainFile': hasMainFile,
                   'buildFormat': buildFormat,
                   'signRelease': signRelease,
                   'updatedAtMillis': updatedAtMillis,
@@ -670,7 +711,12 @@ jobs:
                   if (_isSafeFolderPath(path)) folders.add(path);
                 }
               }
-              folders.addAll(_folderAncestors('lib/main.dart'));
+              final hasMainFile = json['hasMainFile'] is bool
+                  ? json['hasMainFile'] as bool
+                  : (json['dartCode'] ?? '').toString().isNotEmpty;
+              if (hasMainFile || files.keys.any((path) => path.startsWith('lib/'))) {
+                folders.addAll(_folderAncestors('lib/main.dart'));
+              }
               for (final path in files.keys) {
                 folders.addAll(_folderAncestors(path));
               }
@@ -687,6 +733,7 @@ jobs:
                 iconBase64: json['iconBase64']?.toString(),
                 repository: (json['repository'] ?? '').toString(),
                 dynamicThemedIcon: json['dynamicThemedIcon'] is bool ? json['dynamicThemedIcon'] as bool : true,
+                hasMainFile: hasMainFile,
                 buildFormat: (json['buildFormat'] ?? 'apk').toString() == 'aab' ? 'aab' : 'apk',
                 signRelease: json['signRelease'] is bool ? json['signRelease'] as bool : false,
                 updatedAtMillis: (json['updatedAtMillis'] as num?)?.toInt() ?? 0,
@@ -709,8 +756,10 @@ jobs:
               ..remove('iconBase64');
             final metadataBytes = Uint8List.fromList(utf8.encode(jsonEncode(metadata)));
             backup.addFile(ArchiveFile('project.json', metadataBytes.length, metadataBytes));
-            final mainBytes = Uint8List.fromList(utf8.encode(project.dartCode));
-            backup.addFile(ArchiveFile('lib/main.dart', mainBytes.length, mainBytes));
+            if (project.hasMainFile) {
+              final mainBytes = Uint8List.fromList(utf8.encode(project.dartCode));
+              backup.addFile(ArchiveFile('lib/main.dart', mainBytes.length, mainBytes));
+            }
             for (final entry in project.additionalFiles.entries) {
               if (!_isSafeProjectFilePath(entry.key) || entry.key == 'lib/main.dart') continue;
               final bytes = Uint8List.fromList(utf8.encode(entry.value));
@@ -747,8 +796,12 @@ jobs:
                   dartFiles[path] = utf8.decode(entry.content as List<int>, allowMalformed: true);
                 }
               }
-              if (metadataEntry == null || !dartFiles.containsKey('lib/main.dart')) return null;
+              if (metadataEntry == null) return null;
               final metadata = jsonDecode(utf8.decode(metadataEntry.content as List<int>)) as Map<String, dynamic>;
+              final hasMainFile = metadata['hasMainFile'] is bool
+                  ? metadata['hasMainFile'] as bool
+                  : dartFiles.containsKey('lib/main.dart');
+              if (hasMainFile && !dartFiles.containsKey('lib/main.dart')) return null;
               final folders = <String>{};
               if (folderEntry != null) {
                 final raw = jsonDecode(utf8.decode(folderEntry.content as List<int>));
@@ -759,6 +812,7 @@ jobs:
               }
               for (final path in dartFiles.keys) { folders.addAll(_folderAncestors(path)); }
               metadata['dartCode'] = dartFiles.remove('lib/main.dart') ?? '';
+              metadata['hasMainFile'] = hasMainFile;
               metadata['additionalFiles'] = dartFiles;
               metadata['folders'] = folders.toList();
               if (iconEntry != null) metadata['iconBase64'] = base64Encode(iconEntry.content as List<int>);
@@ -778,6 +832,8 @@ jobs:
           // every source file and add any number of folders/files below lib/ before building.
           Map<String, String> _templateFiles(String template) {
             switch (template) {
+              case 'Empty project':
+                return <String, String>{};
               case 'Blank screen':
                 return {
                   'lib/main.dart': '''import 'package:flutter/material.dart';
@@ -1083,7 +1139,7 @@ jobs:
           bool _isSafeProjectFilePath(String path) => _isSafeDartPath(path) || _isSafeAndroidFilePath(path);
           
           bool _isSafeFolderPath(String path) {
-            if (!_validRelativeSegments(path)) return false;
+            if (!_validRelativeSegments(path) || path.length > 240 || path.split('/').length > 20) return false;
             if (path == 'lib' || path.startsWith('lib/')) return true;
             const exactRoots = <String>{'android', 'android/app', 'android/app/src', 'android/app/src/main', 'android/app/src/main/kotlin', 'android/app/src/main/java', 'android/app/src/main/res'};
             if (exactRoots.contains(path)) return true;
@@ -2656,7 +2712,7 @@ jobs:
             Future<void> _editCode(AppProject project) async {
               final source = await Navigator.of(context).push<String>(MaterialPageRoute(builder: (_) => CodeEditorScreen(title: 'Edit ${project.name}', initialText: project.dartCode, kind: 'dart')));
               if (source == null) return;
-              final next = widget.projects.map((p) => p.id == project.id ? p.copyWith(dartCode: source) : p).toList();
+              final next = widget.projects.map((p) => p.id == project.id ? p.copyWith(dartCode: source, hasMainFile: true) : p).toList();
               await widget.onProjectsChanged(next);
             }
           
@@ -2887,16 +2943,10 @@ jobs:
                 if (mounted) setState(() => _busy = false);
               }
               if (source == null || !mounted) return;
-              final edit = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
-                title: const Text('Current build_apk.yml'),
-                content: SizedBox(width: 720, height: MediaQuery.of(dialogContext).size.height * 0.66,
-                  child: SingleChildScrollView(child: SelectableText(source!, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)))),
-                actions: [
-                  TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Close')),
-                  FilledButton.icon(onPressed: () => Navigator.pop(dialogContext, true), icon: const Icon(Icons.edit), label: const Text('Edit YAML')),
-                ],
+              if (!mounted) return;
+              await Navigator.of(context).push<void>(MaterialPageRoute(
+                builder: (_) => CodeEditorScreen(title: 'View build_apk.yml', initialText: source!, kind: 'yaml', readOnly: true),
               ));
-              if (edit == true && mounted) await _editWorkflow();
             }
           
             Future<void> _editWorkflow() async {
@@ -3024,10 +3074,11 @@ jobs:
             late final String _projectId;
             String _targetRepository = '';
             late String _dartCode;
+            bool _mainFileExists = true;
             late Map<String, String> _additionalFiles;
             late Set<String> _folders;
             String _currentFolder = '';
-            String _selectedTemplate = 'Material 3 starter';
+            String _selectedTemplate = 'Empty project';
             String _buildFormat = 'apk';
             bool _signRelease = false;
             Uint8List? _iconBytes;
@@ -3072,6 +3123,9 @@ jobs:
               var path = raw.trim().replaceAll('\\', '/').replaceAll(RegExp(r'^/+|/+$'), '');
               if (path.isEmpty) return '';
               path = path.replaceAll(RegExp(r'/+'), '/');
+              if (folder && !path.startsWith('lib/') && !path.startsWith('android/')) {
+                return _currentFolder.isEmpty ? path : '$_currentFolder/$path';
+              }
               if (path.startsWith('lib/') || path.startsWith('android/')) {
                 // Explicit project-relative paths are honored.
               } else if (!folder && kind == 'proguard') {
@@ -3127,15 +3181,19 @@ jobs:
               _repositoryName = TextEditingController(text: savedRepoName.isNotEmpty ? savedRepoName : fallbackRepoName);
               if (widget.existing == null) {
                 final starter = _templateFiles(_selectedTemplate);
-                _dartCode = starter['lib/main.dart']!;
+                _mainFileExists = starter.containsKey('lib/main.dart');
+                _dartCode = starter['lib/main.dart'] ?? '';
                 _additionalFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
               } else {
                 _dartCode = widget.existing!.dartCode;
+                _mainFileExists = widget.existing!.hasMainFile;
                 _additionalFiles = Map<String, String>.from(widget.existing!.additionalFiles);
                 _selectedTemplate = 'Custom project';
               }
               _folders = <String>{...?(widget.existing?.folders)};
-              _folders.addAll(_folderAncestors('lib/main.dart'));
+              if (_mainFileExists || _additionalFiles.keys.any((path) => path.startsWith('lib/'))) {
+                _folders.addAll(_folderAncestors('lib/main.dart'));
+              }
               for (final path in _additionalFiles.keys) {
                 _folders.addAll(_folderAncestors(path));
               }
@@ -3196,12 +3254,13 @@ jobs:
               repository: normalizeRepository(repository ?? (_targetRepository.isNotEmpty ? _targetRepository : (widget.existing?.repository ?? ''))),
               dynamicThemedIcon: _dynamicThemedIcon,
               folders: Set<String>.from(_folders),
+              hasMainFile: _mainFileExists,
               buildFormat: _buildFormat,
               signRelease: _signRelease,
             );
           
             Map<String, String> _allProjectFiles() => <String, String>{
-              'lib/main.dart': _dartCode,
+              if (_mainFileExists) 'lib/main.dart': _dartCode,
               ..._additionalFiles,
             };
           
@@ -3231,8 +3290,8 @@ jobs:
           
             bool _validateFileTree() {
               final files = _allProjectFiles();
-              if (_dartCode.trim().isEmpty) {
-                _message('lib/main.dart is empty. Add your app entry point before building.');
+              if (!_mainFileExists || _dartCode.trim().isEmpty) {
+                _message('Create lib/main.dart and add your Flutter entry point before building. Empty custom projects can be saved first, but need a main.dart to compile.');
                 return false;
               }
               if (files.length > 250) {
@@ -3313,6 +3372,8 @@ jobs:
                 if (bytes.isEmpty) { _message('The selected Dart file is empty.'); return; }
                 setState(() {
                   _dartCode = utf8.decode(bytes, allowMalformed: true);
+                  _mainFileExists = true;
+                  _folders.addAll(_folderAncestors('lib/main.dart'));
                   _selectedTemplate = 'Custom project';
                 });
                 _scheduleDraftSave();
@@ -3357,9 +3418,12 @@ jobs:
               final importedMain = imported['lib/main.dart'];
               final filesToMerge = Map<String, String>.from(imported)..remove('lib/main.dart');
               setState(() {
-                if (importedMain != null) _dartCode = importedMain;
+                if (importedMain != null) {
+                  _dartCode = importedMain;
+                  _mainFileExists = true;
+                  _folders.addAll(_folderAncestors('lib/main.dart'));
+                }
                 _additionalFiles = <String, String>{..._additionalFiles, ...filesToMerge}..remove('lib/main.dart');
-                _folders.addAll(_folderAncestors('lib/main.dart'));
                 for (final entry in _additionalFiles.keys) {
                   _folders.addAll(_folderAncestors(entry));
                 }
@@ -3705,6 +3769,20 @@ jobs:
             String _stubForProjectFile(String path, String kind) {
               final leaf = path.split('/').last;
               if (kind == 'dart') {
+                if (path == 'lib/main.dart') return '''import 'package:flutter/material.dart';
+
+          void main() => runApp(const _App());
+
+          class _App extends StatelessWidget {
+            const _App({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+              debugShowCheckedModeBanner: false,
+              theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.indigo),
+              home: const Scaffold(body: Center(child: Text('Your app starts here'))),
+            );
+          }
+          ''';
                 final className = _widgetClassNameForPath(path);
                 return '''import 'package:flutter/material.dart';
           
@@ -3770,15 +3848,20 @@ jobs:
                 input = 'android/app/proguard-rules.pro';
               }
               final path = _normaliseNewPath(input, folder: false, kind: kind);
-              if (!_isSafeProjectFilePath(path) || path == 'lib/main.dart') {
-                _message('Invalid path. Use Dart under lib/, Kotlin/Java under android/app/src/main, manifest/resource XML, or android/app/proguard-rules.pro.');
+              if (!_isSafeProjectFilePath(path) || (path == 'lib/main.dart' && _mainFileExists)) {
+                _message('Invalid path or file already exists. Use lib/main.dart for the entry point, other Dart files under lib/, or supported native Android paths.');
                 return;
               }
               if (_allProjectFiles().containsKey(path)) { _message('A file already exists there. Open it from the current folder.'); return; }
               final source = _stubForProjectFile(path, kind);
               final parent = path.substring(0, path.lastIndexOf('/'));
               setState(() {
-                _additionalFiles[path] = source;
+                if (path == 'lib/main.dart') {
+                  _dartCode = source;
+                  _mainFileExists = true;
+                } else {
+                  _additionalFiles[path] = source;
+                }
                 _folders.addAll(_folderAncestors(path));
                 _folders.addAll(_folderAncestors('$parent/placeholder.dart'));
                 if (parent.isNotEmpty) _folders.add(parent);
@@ -3798,6 +3881,8 @@ jobs:
               setState(() {
                 if (path == 'lib/main.dart') {
                   _dartCode = edited;
+                  _mainFileExists = true;
+                  _folders.addAll(_folderAncestors('lib/main.dart'));
                 } else {
                   _additionalFiles[path] = edited;
                   _folders.addAll(_folderAncestors(path));
@@ -3831,6 +3916,49 @@ jobs:
               if (manifest != original) _additionalFiles[manifestPath] = manifest;
             }
           
+            Future<void> _renameFile(String oldPath) async {
+              if (oldPath.endsWith('.kt') || oldPath.endsWith('.java')) {
+                _message('Native Kotlin/Java files are not renamed automatically because their class name, package declaration and manifest may depend on the path. Create the new file, update those references, then delete the old file.');
+                return;
+              }
+              if (oldPath == 'lib/main.dart') {
+                _message('Keep the Flutter entry point named lib/main.dart. You can move other files from the three-dot menu.');
+                return;
+              }
+              final controller = TextEditingController(text: oldPath.split('/').last);
+              final input = await showDialog<String>(context: context, builder: (dialogContext) => AlertDialog(
+                title: const Text('Rename or move file'),
+                content: TextField(controller: controller, autofocus: true, autocorrect: false, decoration: const InputDecoration(labelText: 'New file name or path', hintText: 'home_screen.dart or lib/screens/home_screen.dart', helperText: 'Use a file name to stay in the current folder, or enter a project-relative path to move it.')),
+                actions: [TextButton(onPressed: () => Navigator.pop(dialogContext), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(dialogContext, controller.text.trim()), child: const Text('Save'))],
+              ));
+              controller.dispose();
+              if (input == null || input.trim().isEmpty) return;
+              var nextPath = input.replaceAll('\\', '/').replaceAll(RegExp(r'/+'), '/').replaceAll(RegExp(r'^/+|/+$'), '');
+              if (!nextPath.contains('/')) {
+                final slash = oldPath.lastIndexOf('/');
+                nextPath = slash < 0 ? nextPath : '${oldPath.substring(0, slash)}/$nextPath';
+              }
+              if (!_isSafeProjectFilePath(nextPath) || nextPath == 'lib/main.dart') {
+                _message('Invalid destination. Dart files must be under lib/, and Android files must use supported android/app paths.');
+                return;
+              }
+              if (nextPath == oldPath) return;
+              if (_allProjectFiles().containsKey(nextPath) || _folders.contains(nextPath)) {
+                _message('A file or folder already exists at $nextPath. Nothing was changed.');
+                return;
+              }
+              setState(() {
+                final content = _additionalFiles.remove(oldPath);
+                if (content != null) _additionalFiles[nextPath] = content;
+                _folders.addAll(_folderAncestors(nextPath));
+                // Keep empty folders explicitly created by the user.
+                _currentFolder = nextPath.substring(0, nextPath.lastIndexOf('/'));
+                _selectedTemplate = 'Custom project';
+              });
+              _scheduleDraftSave();
+              _message('Moved file to $nextPath. Check package declarations if this is Kotlin/Java source.');
+            }
+
             Future<void> _removeFile(String path) async {
               // lib/main.dart is the required Flutter entry point and cannot be removed.
               if (path == 'lib/main.dart') {
@@ -3876,7 +4004,7 @@ jobs:
                   decoration: InputDecoration(
                     labelText: 'Folder name or relative path',
                     hintText: 'models or screens/auth',
-                    helperText: 'Created inside ${_currentFolder.isEmpty ? 'lib/' : '$_currentFolder/'}.',
+                    helperText: 'Created inside ${_currentFolder.isEmpty ? 'project root' : '$_currentFolder'}.',
                   ),
                 ),
                 actions: [
@@ -3887,7 +4015,7 @@ jobs:
               controller.dispose();
               if (input == null || input.trim().isEmpty) return;
               final path = _normaliseNewPath(input, folder: true);
-              if (!_isSafeFolderPath(path)) { _message('Enter a folder name such as models or a nested path such as screens/auth.'); return; }
+              if (!_isSafeFolderPath(path)) { _message(_currentFolder.isEmpty ? 'At the project root, create lib (or optional android). Then open lib to create screens, models and other subfolders.' : 'Choose a safe subfolder name such as screens or a nested path such as screens/auth.'); return; }
               if (_folders.contains(path)) { _message('That folder already exists.'); return; }
               setState(() {
                 _folders.addAll(_folderAncestors('$path/placeholder.dart'));
@@ -3976,7 +4104,7 @@ jobs:
               }
               final confirmed = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
                 title: const Text('Replace project source?'),
-                content: const Text('Applying a template replaces the Dart source tree but keeps your Android Kotlin/Java/XML/ProGuard files and Maven dependency settings.'),
+                content: const Text('Applying a template replaces the Dart source tree but keeps your Android Kotlin/Java/XML/ProGuard files and Maven dependency settings. Empty project removes Dart files and folders so you can create lib/main.dart yourself; building remains disabled until main.dart exists and contains code.'),
                 actions: [
                   TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
                   FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Apply template')),
@@ -3985,11 +4113,15 @@ jobs:
               if (confirmed != true) return;
               final starter = _templateFiles(_selectedTemplate);
               setState(() {
-                _dartCode = starter['lib/main.dart']!;
+                _mainFileExists = starter.containsKey('lib/main.dart');
+                _dartCode = starter['lib/main.dart'] ?? '';
                 final nativeFiles = <String, String>{for (final entry in _additionalFiles.entries) if (!entry.key.startsWith('lib/')) entry.key: entry.value};
                 final starterFiles = Map<String, String>.from(starter)..remove('lib/main.dart');
                 _additionalFiles = <String, String>{...nativeFiles, ...starterFiles};
-                _folders = <String>{..._folders, ..._folderAncestors('lib/main.dart'), ..._additionalFiles.keys.expand(_folderAncestors)};
+                _folders = <String>{..._folders.where((folder) => folder != 'lib' && !folder.startsWith('lib/')), ..._additionalFiles.keys.expand(_folderAncestors)};
+                if (_mainFileExists || _additionalFiles.keys.any((path) => path.startsWith('lib/'))) {
+                  _folders.addAll(_folderAncestors('lib/main.dart'));
+                }
                 _currentFolder = '';
               });
               _scheduleDraftSave();
@@ -4390,7 +4522,17 @@ jobs:
                 onTap: () => _editFile(path),
                 trailing: Row(mainAxisSize: MainAxisSize.min, children: [
                   IconButton(tooltip: 'Edit ${path.split('/').last}', onPressed: () => _editFile(path), icon: const Icon(Icons.edit_outlined)),
-                  if (!isMain) IconButton(tooltip: 'Delete ${path.split('/').last}', onPressed: () => _removeFile(path), icon: const Icon(Icons.delete_outline)),
+                  PopupMenuButton<String>(
+                    tooltip: 'File actions',
+                    onSelected: (action) {
+                      if (action == 'rename') _renameFile(path);
+                      if (action == 'delete' && !isMain) _removeFile(path);
+                    },
+                    itemBuilder: (_) => <PopupMenuEntry<String>>[
+                      const PopupMenuItem(value: 'rename', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename / move'))),
+                      if (!isMain) const PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete file'))),
+                    ],
+                  ),
                 ]),
               ),
             );
@@ -4503,6 +4645,7 @@ jobs:
                         decoration: const InputDecoration(labelText: 'Starting template'),
                         items: const [
                           DropdownMenuItem(value: 'Material 3 starter', child: Text('Material 3 app starter (5 files)')),
+                          DropdownMenuItem(value: 'Empty project', child: Text('Empty project (create lib and files yourself)')),
                           DropdownMenuItem(value: 'Counter example', child: Text('Counter example')),
                           DropdownMenuItem(value: 'Blank screen', child: Text('Blank screen')),
                           DropdownMenuItem(value: 'Custom project', child: Text('Custom project (keep my files)')),
@@ -4541,7 +4684,7 @@ jobs:
                           ),
                           const Divider(height: 1),
                           if (_visibleFolders.isEmpty && _visibleFiles.isEmpty)
-                            const Padding(padding: EdgeInsets.all(20), child: Column(children: [Icon(Icons.folder_open, size: 38), SizedBox(height: 8), Text('This folder is empty.'), Text('Create a folder or Dart file to get started.', style: TextStyle(fontSize: 12))]))
+                            const Padding(padding: EdgeInsets.all(20), child: Column(children: [Icon(Icons.folder_open, size: 38), SizedBox(height: 8), Text('This folder is empty.'), Text('Create lib/ first, open it, then create main.dart. Or choose a starter template above.', textAlign: TextAlign.center, style: TextStyle(fontSize: 12))]))
                           else ...[
                             ..._visibleFolders.map((folder) => ListTile(
                               dense: true,
@@ -4550,9 +4693,10 @@ jobs:
                               subtitle: Text('${_allProjectFiles().keys.where((file) => file.startsWith('$folder/')).length} file(s) below'),
                               trailing: PopupMenuButton<String>(
                                 tooltip: 'Folder actions',
-                                onSelected: (action) { if (action == 'rename') _renameFolder(folder); if (action == 'delete') _deleteFolder(folder); if (action == 'new_file') { setState(() => _currentFolder = folder); _addProjectFile(); } },
+                                onSelected: (action) { if (action == 'rename') _renameFolder(folder); if (action == 'delete') _deleteFolder(folder); if (action == 'new_file') { setState(() => _currentFolder = folder); _addProjectFile(); } if (action == 'new_folder') { setState(() => _currentFolder = folder); _createFolder(); } },
                                 itemBuilder: (_) => const [
                                   PopupMenuItem(value: 'new_file', child: ListTile(dense: true, leading: Icon(Icons.note_add_outlined), title: Text('Create file inside'))),
+                                  PopupMenuItem(value: 'new_folder', child: ListTile(dense: true, leading: Icon(Icons.create_new_folder_outlined), title: Text('Create subfolder'))),
                                   PopupMenuItem(value: 'rename', child: ListTile(dense: true, leading: Icon(Icons.drive_file_rename_outline), title: Text('Rename folder'))),
                                   PopupMenuItem(value: 'delete', child: ListTile(dense: true, leading: Icon(Icons.delete_outline), title: Text('Delete folder'))),
                                 ],
@@ -4674,58 +4818,100 @@ jobs:
           }
           
           class CodeEditorScreen extends StatefulWidget {
-            const CodeEditorScreen({super.key, required this.title, required this.initialText, required this.kind});
+            const CodeEditorScreen({super.key, required this.title, required this.initialText, required this.kind, this.readOnly = false});
             final String title;
             final String initialText;
             final String kind;
+            final bool readOnly;
           
             @override
             State<CodeEditorScreen> createState() => _CodeEditorScreenState();
           }
           
           class _CodeEditorScreenState extends State<CodeEditorScreen> {
-            late final CodeController _controller;
+            static const int _syntaxHighlightLimit = 60000;
+            late final bool _largeDocumentMode;
+            CodeController? _codeController;
+            TextEditingController? _plainController;
+            bool get _usesPlainEditor => _largeDocumentMode || widget.readOnly;
+            String get _text => _codeController?.text ?? _plainController?.text ?? widget.initialText;
           
             @override
             void initState() {
               super.initState();
-              _controller = CodeController(
-                text: widget.initialText,
-                language: widget.kind == 'yaml'
-                    ? yaml_language.yaml
-                    : widget.kind == 'kotlin'
-                        ? kotlin_language.kotlin
-                        : widget.kind == 'java' || widget.kind == 'proguard'
-                            ? java_language.java
-                            : widget.kind == 'xml'
-                                ? xml_language.xml
-                                : dart_language.dart,
-              );
+              // Parsing and highlighting a 300 KB workflow on the UI thread caused long
+              // stalls. Keep the syntax editor for normal files and use a lightweight editor
+              // for very large files; the YAML can still be viewed and edited in full.
+              _largeDocumentMode = widget.initialText.length > _syntaxHighlightLimit;
+              if (_largeDocumentMode || widget.readOnly) {
+                _plainController = TextEditingController(text: widget.initialText);
+              } else {
+                _codeController = CodeController(
+                  text: widget.initialText,
+                  language: widget.kind == 'yaml'
+                      ? yaml_language.yaml
+                      : widget.kind == 'kotlin'
+                          ? kotlin_language.kotlin
+                          : widget.kind == 'java' || widget.kind == 'proguard'
+                              ? java_language.java
+                              : widget.kind == 'xml'
+                                  ? xml_language.xml
+                                  : dart_language.dart,
+                );
+              }
             }
           
             @override
-            void dispose() { _controller.dispose(); super.dispose(); }
+            void dispose() {
+              _codeController?.dispose();
+              _plainController?.dispose();
+              super.dispose();
+            }
           
             @override
             Widget build(BuildContext context) {
               final dark = Theme.of(context).brightness == Brightness.dark;
+              final codeStyle = TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45, color: dark ? const Color(0xFFE6E6E6) : const Color(0xFF202124));
               return Scaffold(
-                appBar: AppBar(title: Text(widget.title), actions: [IconButton(tooltip: 'Save changes', onPressed: () => Navigator.pop(context, _controller.text), icon: const Icon(Icons.check))]),
-                body: CodeTheme(
-                  data: CodeThemeData(styles: dark ? monokaiSublimeTheme : githubTheme),
-                  child: Directionality(
-                    // Code and line numbers must remain left-to-right even on Hebrew/RTL devices.
-                    textDirection: TextDirection.ltr,
-                    child: CodeField(
-                      controller: _controller,
-                      expands: true,
-                      wrap: false,
-                      padding: const EdgeInsets.all(16),
-                      textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45),
-                      gutterStyle: GutterStyle(showLineNumbers: true, showErrors: false, showFoldingHandles: false, textAlign: TextAlign.end, textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45), width: 72, margin: 8),
-                      lineNumberBuilder: (lineNumber, style) => TextSpan(text: '${lineNumber + 1}', style: style),
+                appBar: AppBar(title: Text(widget.title), actions: [
+                  if (!widget.readOnly) IconButton(tooltip: 'Save changes', onPressed: () => Navigator.pop(context, _text), icon: const Icon(Icons.check)),
+                ]),
+                body: Directionality(
+                  textDirection: TextDirection.ltr,
+                  child: Column(children: [
+                    if (_largeDocumentMode) Container(
+                      width: double.infinity,
+                      color: Theme.of(context).colorScheme.tertiaryContainer,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      child: const Text('Large-file mode: syntax highlighting is paused to open this file quickly. All content is preserved.', style: TextStyle(fontSize: 12)),
                     ),
-                  ),
+                    Expanded(child: _usesPlainEditor
+                      ? TextField(
+                          controller: _plainController,
+                          readOnly: widget.readOnly,
+                          expands: true,
+                          minLines: null,
+                          maxLines: null,
+                          keyboardType: TextInputType.multiline,
+                          autocorrect: false,
+                          enableSuggestions: false,
+                          textAlign: TextAlign.left,
+                          style: codeStyle,
+                          decoration: const InputDecoration(border: InputBorder.none, contentPadding: EdgeInsets.all(16)),
+                        )
+                      : CodeTheme(
+                          data: CodeThemeData(styles: dark ? monokaiSublimeTheme : githubTheme),
+                          child: CodeField(
+                            controller: _codeController!,
+                            expands: true,
+                            wrap: false,
+                            padding: const EdgeInsets.all(16),
+                            textStyle: codeStyle,
+                            gutterStyle: GutterStyle(showLineNumbers: true, showErrors: false, showFoldingHandles: false, textAlign: TextAlign.end, textStyle: const TextStyle(fontFamily: 'monospace', fontSize: 13, height: 1.45), width: 72, margin: 8),
+                            lineNumberBuilder: (lineNumber, style) => TextSpan(text: '${lineNumber + 1}', style: style),
+                          ),
+                        )),
+                  ]),
                 ),
               );
             }
@@ -5029,7 +5215,12 @@ jobs:
           packages = set()
           for source_file in (target / 'lib').rglob('*.dart'):
               source = source_file.read_text(encoding='utf-8')
-              packages.update(re.findall(r"package:([A-Za-z][A-Za-z0-9_]*)/", source))
+              # Remove comments before dependency detection so examples, TODOs and commented
+              # imports do not silently add native plugins that the app never uses.
+              source = re.sub(r'/\*[\s\S]*?\*/', '', source)
+              source = re.sub(r'(?m)^\s*//.*$', '', source)
+              directives = re.findall(r'''(?m)^\s*(?:import|export|part)\s+['"]package:([A-Za-z][A-Za-z0-9_]*)/''', source)
+              packages.update(directives)
           for dep in re.split(r'[,;\s]+', os.environ.get('DEPENDENCIES', '').strip()):
               if dep:
                   if not re.fullmatch(r'[a-z][a-z0-9_]*', dep):
