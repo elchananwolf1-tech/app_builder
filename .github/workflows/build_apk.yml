@@ -310,9 +310,9 @@ jobs:
           wrapper = android_dir / 'gradle/wrapper/gradle-wrapper.properties'
           if wrapper.is_file():
               wrapper_text = wrapper.read_text(encoding='utf-8')
-              wrapper_text = re.sub(r'gradle-[0-9][A-Za-z0-9_.-]*-(?:bin|all)\.zip', 'gradle-8.13-bin.zip', wrapper_text)
+              wrapper_text = re.sub(r'gradle-[0-9][A-Za-z0-9_.-]*-(?:bin|all)\.zip', 'gradle-8.14.3-bin.zip', wrapper_text)
               wrapper.write_text(wrapper_text, encoding='utf-8')
-          print('Pinned generated Android project to AGP 8.11.1 / Gradle 8.13 where a version declaration is present.')
+          print('Pinned generated Android project to AGP 8.11.1 / Gradle 8.14.3 where a version declaration is present.')
           PY
           cat > "$RUNNER_TEMP/patch_flutter_plugin_gradle.py" <<'PYPLUGIN'
           import json, re, sys
