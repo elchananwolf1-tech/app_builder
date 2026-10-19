@@ -428,6 +428,102 @@ jobs:
                           patched.append(str(gradle))
           print(f'Kotlin/AGP compatibility preflight inspected {inspected} Kotlin-enabled Flutter plugin Gradle file(s).')
           print('Adjusted missing/out-of-order Android plugin configuration in: ' + (', '.join(patched) if patched else '(no adjustment needed)'))
+
+          # Repair a known Android WorkManager source incompatibility: periodic work must
+          # receive ExistingPeriodicWorkPolicy, never the one-time ExistingWorkPolicy.
+          # Apply this narrowly to enqueueUniquePeriodicWork arguments or files dedicated
+          # only to periodic work; do not alter valid one-time enqueueUniqueWork calls.
+          def second_argument_spans(source, method_name):
+              spans = []
+              for match in re.finditer(r'\b' + re.escape(method_name) + r'\s*\(', source):
+                  opening = source.find('(', match.start())
+                  depth = 0
+                  quote = None
+                  escaped = False
+                  commas = []
+                  closing = None
+                  for index in range(opening, len(source)):
+                      ch = source[index]
+                      if quote:
+                          if escaped:
+                              escaped = False
+                          elif ch == '\\':
+                              escaped = True
+                          elif ch == quote:
+                              quote = None
+                          continue
+                      if ch in ('\"', "'"):
+                          quote = ch
+                      elif ch == '(':
+                          depth += 1
+                      elif ch == ')':
+                          depth -= 1
+                          if depth == 0:
+                              closing = index
+                              break
+                      elif ch == ',' and depth == 1:
+                          commas.append(index)
+                  if closing is not None and len(commas) >= 1:
+                      spans.append((commas[0] + 1, commas[1] if len(commas) >= 2 else closing))
+              return spans
+
+          periodic_patched = []
+          source_roots = [project_root / 'android/app/src/main'] if project_root else []
+          source_roots += [package_dir / 'android' for package_dir in package_roots]
+          seen_sources = set()
+          for source_root in source_roots:
+              if not source_root.is_dir():
+                  continue
+              for source_path in source_root.rglob('*'):
+                  if not source_path.is_file() or source_path.suffix.lower() not in ('.kt', '.java'):
+                      continue
+                  resolved_path = source_path.resolve()
+                  if resolved_path in seen_sources:
+                      continue
+                  seen_sources.add(resolved_path)
+                  try:
+                      source = source_path.read_text(encoding='utf-8')
+                  except (OSError, UnicodeError):
+                      continue
+                  if 'enqueueUniquePeriodicWork' not in source or 'ExistingWorkPolicy' not in source:
+                      continue
+                  original = source
+                  spans = second_argument_spans(source, 'enqueueUniquePeriodicWork')
+                  one_time_spans = second_argument_spans(source, 'enqueueUniqueWork')
+                  periodic_variables = set()
+                  for start, end in reversed(spans):
+                      arg = source[start:end]
+                      stripped_arg = arg.strip()
+                      if 'ExistingWorkPolicy' in arg:
+                          arg = re.sub(r'\bExistingWorkPolicy\b', 'ExistingPeriodicWorkPolicy', arg)
+                          source = source[:start] + arg + source[end:]
+                      elif re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', stripped_arg):
+                          if not any(source[other_start:other_end].strip() == stripped_arg for other_start, other_end in one_time_spans):
+                              periodic_variables.add(stripped_arg)
+                  # Fix simple policy variables passed only to periodic work. Do not change a
+                  # variable that is also passed to enqueueUniqueWork, which correctly needs
+                  # the one-time policy enum.
+                  for variable in periodic_variables:
+                      variable_name = re.escape(variable)
+                      # Kotlin local declarations, function parameters, and Java variables.
+                      source = re.sub(r'(\b(?:val|var)\s+' + variable_name + r'\s*:\s*)ExistingWorkPolicy\b', r'\1ExistingPeriodicWorkPolicy', source)
+                      source = re.sub(r'(\b' + variable_name + r'\s*:\s*)ExistingWorkPolicy\b', r'\1ExistingPeriodicWorkPolicy', source)
+                      source = re.sub(r'\bExistingWorkPolicy(\s+' + variable_name + r'\b)', r'ExistingPeriodicWorkPolicy\1', source)
+                      # Correct only assignments to this periodic-only variable, not other
+                      # ExistingWorkPolicy uses that may still belong to one-time operations.
+                      source = re.sub(r'(\b' + variable_name + r'\s*(?::\s*ExistingPeriodicWorkPolicy)?\s*=\s*)ExistingWorkPolicy\.', r'\1ExistingPeriodicWorkPolicy.', source)
+                  if source != original and 'ExistingPeriodicWorkPolicy' in source and not re.search(r'(?m)^\s*import\s+androidx\.work\.ExistingPeriodicWorkPolicy\s*;?\s*$', source):
+                      import_line = 'import androidx.work.ExistingPeriodicWorkPolicy' + (';' if source_path.suffix.lower() == '.java' else '')
+                      package_match = re.search(r'(?m)^package\s+[^;\n]+;?\s*$', source)
+                      if package_match:
+                          insert_at = package_match.end()
+                          source = source[:insert_at] + '\n' + import_line + source[insert_at:]
+                      else:
+                          source = import_line + '\n' + source
+                  if source != original:
+                      source_path.write_text(source, encoding='utf-8')
+                      periodic_patched.append(str(source_path))
+          print('Corrected periodic WorkManager policy types in: ' + (', '.join(periodic_patched) if periodic_patched else '(no incompatible call found)'))
           PYPLUGIN
 
           cat > "$RUNNER_TEMP/prepare_launcher_icons.py" <<'PYICON'
@@ -2850,7 +2946,7 @@ jobs:
                 'The template creates a blank native Activity class inside the Flutter project’s existing Android app module and registers it in the custom manifest fragment. It is not a separate Android Studio Gradle project; Flutter continues to use its generated MainActivity as the app entry point.',
                 'To bring your own source in, tap Import Android source and select a .kt, .java, XML, AndroidManifest.xml, or ProGuard file. Confirm the destination path before importing.',
                 'Resource XML files belong below android/app/src/main/res/, for example values/strings.xml or layout/activity_example.xml. The selected resource folder type must match Android conventions.',
-                'AndroidManifest.xml is merged with Flutter generated manifest settings. Avoid adding a second exported launcher activity unless you deliberately intend to change the app launch behavior.',
+                'AndroidManifest.xml is merged with Flutter settings. The build keeps Flutter MainActivity as the only launcher so a custom Java/Kotlin Activity cannot create a duplicate app icon.',
                 'For Kotlin or Java functionality to be called from Dart, you usually need a platform channel, often MethodChannel, implemented on both the Dart and native sides. Adding a native class alone does not automatically connect it to Flutter UI.',
                 'Project-wide Gradle scripts are generated and patched by the workflow, so they are intentionally not imported as ordinary source files. Use the supported Maven dependency field for extra Android libraries.',
               ]),
@@ -5450,7 +5546,66 @@ jobs:
               generated_root = tree.getroot()
               android_name = f'{{{android_uri}}}name'
               android_authorities = f'{{{android_uri}}}authorities'
-              app_attrs_to_preserve = {f'{{{android_uri}}}label', f'{{{android_uri}}}icon', f'{{{android_uri}}}roundIcon'}
+              android_action = f'{{{android_uri}}}name'
+              android_label = f'{{{android_uri}}}label'
+              app_attrs_to_preserve = {android_label, f'{{{android_uri}}}icon', f'{{{android_uri}}}roundIcon'}
+
+              # Resolve relative/short activity names to the same fully-qualified class.
+              # This prevents `.MainActivity` and `com.example.app.MainActivity` from
+              # being appended as separate manifest entries after a custom-manifest merge.
+              app_namespace = ''
+              for gradle_file in (target / 'android/app/build.gradle.kts', target / 'android/app/build.gradle'):
+                  if not gradle_file.is_file():
+                      continue
+                  gradle_text = gradle_file.read_text(encoding='utf-8')
+                  namespace_match = re.search(r'(?m)^\s*namespace\s*(?:=\s*)?[\"\']([^\"\']+)', gradle_text)
+                  if not namespace_match:
+                      namespace_match = re.search(r'(?m)^\s*applicationId\s*(?:=\s*)?[\"\']([^\"\']+)', gradle_text)
+                  if namespace_match:
+                      app_namespace = namespace_match.group(1)
+                      break
+
+              def canonical_component_name(value):
+                  if not value:
+                      return ''
+                  value = value.strip()
+                  if value.startswith('.'):
+                      return app_namespace + value if app_namespace else value
+                  if '.' not in value and app_namespace:
+                      return app_namespace + '.' + value
+                  return value
+
+              def has_launcher_intent(component):
+                  for intent_filter in component.findall('intent-filter'):
+                      actions = {item.get(android_action) for item in intent_filter.findall('action')}
+                      categories = {item.get(android_action) for item in intent_filter.findall('category')}
+                      if 'android.intent.action.MAIN' in actions and 'android.intent.category.LAUNCHER' in categories:
+                          return True
+                  return False
+
+              def strip_launcher_intent(component):
+                  changed = False
+                  for intent_filter in list(component.findall('intent-filter')):
+                      actions = {item.get(android_action) for item in intent_filter.findall('action')}
+                      categories = {item.get(android_action) for item in intent_filter.findall('category')}
+                      if 'android.intent.action.MAIN' not in actions or 'android.intent.category.LAUNCHER' not in categories:
+                          continue
+                      for child in list(intent_filter):
+                          if child.tag == 'action' and child.get(android_action) == 'android.intent.action.MAIN':
+                              intent_filter.remove(child)
+                          elif child.tag == 'category' and child.get(android_action) == 'android.intent.category.LAUNCHER':
+                              intent_filter.remove(child)
+                      if len(intent_filter) == 0:
+                          component.remove(intent_filter)
+                      changed = True
+                  return changed
+
+              generated_app = generated_root.find('application')
+              generated_launcher_names = set()
+              if generated_app is not None:
+                  for component in list(generated_app):
+                      if component.tag in ('activity', 'activity-alias') and has_launcher_intent(component):
+                          generated_launcher_names.add(canonical_component_name(component.get(android_name)))
               for key, value in custom_root.attrib.items():
                   if key not in ('package', f'{{{android_uri}}}versionCode', f'{{{android_uri}}}versionName'):
                       generated_root.set(key, value)
@@ -5468,7 +5623,22 @@ jobs:
                               generated_app.set(key, value)
                       for child in list(node):
                           name = child.get(android_name) or child.get(android_authorities)
-                          existing = next((item for item in list(generated_app) if item.tag == child.tag and ((name and (item.get(android_name) == name or item.get(android_authorities) == name)) or (not name and ET.tostring(item, encoding='unicode') == ET.tostring(child, encoding='unicode')))), None)
+                          if child.tag in ('activity', 'activity-alias') and has_launcher_intent(child):
+                              custom_component_name = canonical_component_name(child.get(android_name))
+                              if custom_component_name not in generated_launcher_names:
+                                  if strip_launcher_intent(child):
+                                      print('::warning::Removed a second MAIN/LAUNCHER intent-filter from custom AndroidManifest.xml. Only Flutter MainActivity is kept as the app launcher, preventing duplicate icons.')
+                          def same_application_component(item):
+                              if item.tag != child.tag:
+                                  return False
+                              if child.tag in ('activity', 'activity-alias'):
+                                  left = canonical_component_name(item.get(android_name))
+                                  right = canonical_component_name(child.get(android_name))
+                                  return bool(left and right and left == right)
+                              if name:
+                                  return item.get(android_name) == name or item.get(android_authorities) == name
+                              return ET.tostring(item, encoding='unicode') == ET.tostring(child, encoding='unicode')
+                          existing = next((item for item in list(generated_app) if same_application_component(item)), None)
                           if existing is None:
                               generated_app.append(copy.deepcopy(child))
                           else:
@@ -5489,33 +5659,16 @@ jobs:
                       for key, value in node.attrib.items():
                           if key != android_name:
                               existing.set(key, value)
-              # Keep the generated Flutter MainActivity as the only launcher.
-              # A custom AudioServiceActivity with MAIN/LAUNCHER creates a second
-              # Android home-screen icon; this builder merges manifests directly
-              # and does not implement Android's tools:node="remove" semantics.
-              launcher_action = f'{{{android_uri}}}name'
-              main_activity = None
-              activities = list(generated_app.findall('activity'))
-              for activity in activities:
-                  activity_name = activity.get(android_name, '')
-                  has_main_launcher = any(
-                      any(item.tag == 'action' and item.get(launcher_action) == 'android.intent.action.MAIN' for item in intent_filter)
-                      and any(item.tag == 'category' and item.get(launcher_action) == 'android.intent.category.LAUNCHER' for item in intent_filter)
-                      for intent_filter in activity.findall('intent-filter')
-                  )
-                  if has_main_launcher and activity_name.endswith('.MainActivity'):
-                      main_activity = activity
-                      break
-              if main_activity is not None:
-                  for activity in activities:
-                      if activity is main_activity:
-                          continue
-                      for intent_filter in list(activity.findall('intent-filter')):
-                          has_main = any(item.tag == 'action' and item.get(launcher_action) == 'android.intent.action.MAIN' for item in intent_filter)
-                          has_launcher = any(item.tag == 'category' and item.get(launcher_action) == 'android.intent.category.LAUNCHER' for item in intent_filter)
-                          if has_main and has_launcher:
-                              activity.remove(intent_filter)
-                              print(f'::notice::Removed extra launcher intent-filter from {activity.get(android_name, "unnamed activity")} to prevent duplicate app icons.')
+              # Final safeguard: ensure exactly one component exposes the MAIN/LAUNCHER
+              # pair, preferring Flutter's originally generated launcher Activity.
+              launchers = [component for component in list(generated_app)
+                           if component.tag in ('activity', 'activity-alias') and has_launcher_intent(component)]
+              preferred_launcher = next((component for component in launchers
+                                         if canonical_component_name(component.get(android_name)) in generated_launcher_names),
+                                        launchers[0] if launchers else None)
+              for component in launchers:
+                  if component is not preferred_launcher and strip_launcher_intent(component):
+                      print('::warning::Suppressed an extra Android launcher entry to keep a single app icon.')
               tree.write(generated_path, encoding='utf-8', xml_declaration=True)
 
           def merge_values_resource(custom_bytes, generated_path):
@@ -5636,6 +5789,23 @@ jobs:
               if generated_kotlin.is_file():
                   generated_kotlin.unlink()
                   print(f'Removed generated Kotlin MainActivity because a Java implementation was imported: {matching_kotlin}')
+
+          # file_picker 11+ exposes picker operations as static FilePicker methods.
+          # Migrate older FilePicker.platform.* calls in imported source to avoid API errors.
+          migrated_file_picker_calls = 0
+          for dart_file in lib_dir.rglob('*.dart'):
+              try:
+                  before = dart_file.read_text(encoding='utf-8')
+              except (OSError, UnicodeError):
+                  continue
+              after, changed = re.subn(
+                  r'\bFilePicker\s*\.\s*platform\s*\.\s*(pickFiles|pickFile|getDirectoryPath|saveFile)\b',
+                  r'FilePicker.\1', before)
+              if changed:
+                  dart_file.write_text(after, encoding='utf-8')
+                  migrated_file_picker_calls += changed
+          if migrated_file_picker_calls:
+              print(f'Migrated {migrated_file_picker_calls} legacy FilePicker.platform call(s) to the static FilePicker API.')
 
           main_file = lib_dir / 'main.dart'
           if not main_file.is_file() or not main_file.read_text(encoding='utf-8').strip():
