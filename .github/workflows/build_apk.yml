@@ -5489,6 +5489,33 @@ jobs:
                       for key, value in node.attrib.items():
                           if key != android_name:
                               existing.set(key, value)
+              # Keep the generated Flutter MainActivity as the only launcher.
+              # A custom AudioServiceActivity with MAIN/LAUNCHER creates a second
+              # Android home-screen icon; this builder merges manifests directly
+              # and does not implement Android's tools:node="remove" semantics.
+              launcher_action = f'{{{android_uri}}}name'
+              main_activity = None
+              activities = list(generated_app.findall('activity'))
+              for activity in activities:
+                  activity_name = activity.get(android_name, '')
+                  has_main_launcher = any(
+                      any(item.tag == 'action' and item.get(launcher_action) == 'android.intent.action.MAIN' for item in intent_filter)
+                      and any(item.tag == 'category' and item.get(launcher_action) == 'android.intent.category.LAUNCHER' for item in intent_filter)
+                      for intent_filter in activity.findall('intent-filter')
+                  )
+                  if has_main_launcher and activity_name.endswith('.MainActivity'):
+                      main_activity = activity
+                      break
+              if main_activity is not None:
+                  for activity in activities:
+                      if activity is main_activity:
+                          continue
+                      for intent_filter in list(activity.findall('intent-filter')):
+                          has_main = any(item.tag == 'action' and item.get(launcher_action) == 'android.intent.action.MAIN' for item in intent_filter)
+                          has_launcher = any(item.tag == 'category' and item.get(launcher_action) == 'android.intent.category.LAUNCHER' for item in intent_filter)
+                          if has_main and has_launcher:
+                              activity.remove(intent_filter)
+                              print(f'::notice::Removed extra launcher intent-filter from {activity.get(android_name, "unnamed activity")} to prevent duplicate app icons.')
               tree.write(generated_path, encoding='utf-8', xml_declaration=True)
 
           def merge_values_resource(custom_bytes, generated_path):
